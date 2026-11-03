@@ -1,0 +1,6 @@
+state/
+__pycache__/
+# personal copies that live next to the code on the author's mac
+skill/
+com.*.plist
+*.local.*
