@@ -8,7 +8,9 @@ by itself (checked 02.11.2026); a thread that isn't open in the app gets opened 
 
     codex_wake.py add <thread> [--mode review|recommended] [--plan PATH] [--name NAME]
     codex_wake.py add-items --plan PATH [--mode ...] [--name NAME] [--cwd DIR]
-                                             a fresh `codex exec` per plan item, no long thread (since 02.11.2026)
+                                             a fresh run per plan item, no long thread (since 02.11.2026); the run goes
+                                             to whichever seat has room: Codex, Claude 1, Claude 2 (since 06.11.2026)
+    codex_wake.py seat 1|2|3 on|off          let item runs (and the session carousel) use that seat or not
     codex_wake.py remove|pause|resume <thread|all>
     codex_wake.py list | status [--json] | limits
     codex_wake.py wake <thread> [--force]    wake right now (skips the "was it limited" check with --force)
@@ -357,8 +359,7 @@ def carousel_start(sid):
     if len(hits) != 1:
         sys.exit('не нашёл живую сессию Claude с таким ID' if not hits else 'под это начало подходят несколько сессий — вставь ID целиком')
     pid, acc, name, full = hits[0]
-    for n in (1, 2, 3):  # Damir 03.11: when the carousel is on, every seat is fair game
-        subprocess.run([sys.executable, str(WATCH_LIMIT), '--account-on', str(n)], capture_output=True, env=TOOL_ENV)
+    # 03.11 starting it switched every seat on; since 06.11 each seat has its own switch in the window, so leave them be
     r = subprocess.run([sys.executable, str(WATCH_LIMIT), '--pid', str(pid)], capture_output=True, text=True, env=TOOL_ENV,
                        cwd=str(HOME))
     log(f'carousel on for {full} (pid {pid}, account {acc}): {(r.stdout or r.stderr).strip()[:200]}')
@@ -369,6 +370,78 @@ def carousel_stop(sid):
     r = subprocess.run([sys.executable, str(WATCH_LIMIT), '--sid', sid, '--stop'], capture_output=True, text=True, env=TOOL_ENV)
     log(f'carousel off for {sid}: {(r.stdout or r.stderr).strip()[:200]}')
     print((r.stdout or r.stderr).strip())
+
+
+# ---------- seats: who runs the next plan item ----------
+# Same switches as the session carousel (its off-* files), so one row of toggles in the window rules both.
+SEATS = ('3', '1', '2')  # Codex first so Claude stays free for live sessions, then the personal account, then the work one
+SEAT_NAMES = {'1': 'Claude 1', '2': 'Claude 2', '3': 'Codex'}
+SEAT_OFF = {'1': 'off-account1', '2': 'off-account2', '3': 'off-codex'}
+CLAUDE_BIN = HOME / '.local/bin/claude'
+CLAUDE_FULL = 97        # a Claude window this full counts as gone, the run would just die on it
+CLAUDE_REST = 900       # a Claude seat that said "limit" but gave no reset time rests this long
+BROKEN_REST = 3600      # "not logged in" and the like: nothing to retry every minute
+
+
+def seat_on(s):
+    return not (HANDOFF_STATE / SEAT_OFF[s]).exists()
+
+
+def set_seat(s, on):
+    f = HANDOFF_STATE / SEAT_OFF[s]
+    if on:
+        f.unlink(missing_ok=True)
+    else:
+        HANDOFF_STATE.mkdir(parents=True, exist_ok=True)
+        f.write_text(datetime.now().isoformat(timespec='seconds'))
+    log(f'seat {s} ({SEAT_NAMES[s]}) switched {"on" if on else "off"}')
+
+
+def claude_dir(s):
+    """Config dir of a Claude seat, None when that account isn't set up on this mac."""
+    i = int(s) - 1
+    return CLAUDE_DIRS[i] if i < len(CLAUDE_DIRS) and CLAUDE_BIN.exists() else None
+
+
+def claude_full_until(usage, now):
+    """Reset time of the window that is full, None when there's room (or nothing is known: then just try)."""
+    for w in (usage or {}).values():
+        if (w.get('used_percentage') or 0) >= CLAUDE_FULL and (w.get('resets_at') or 0) > now:
+            return w['resets_at']
+    return None
+
+
+def pick_seat(t, now, limits_ok):
+    """First seat that is switched on, not resting after a limit and has room. Resting seats are written to t['rest']."""
+    rest = t.setdefault('rest', {})
+    for s in SEATS:
+        if not seat_on(s) or rest.get(s, 0) > now:
+            continue
+        if s == '3':
+            if limits_ok():
+                return s
+            continue
+        if not claude_dir(s):
+            continue
+        until = claude_full_until((claude_usage_cached().get('accounts') or {}).get(s), now)
+        if until:
+            rest[s] = until + AFTER_RESET
+            continue
+        return s
+    return None
+
+
+def rest_seat(t, s, outcome, now):
+    """A run on seat s hit the limit (or the seat is broken): keep off it for a while."""
+    if outcome == 'broken':
+        until = now + BROKEN_REST
+    elif s == '3':
+        until = now + LIMITS_EVERY  # exec says "limit" before the app-server does (02.11), so trust exec, then ask fresh
+    else:
+        reset = claude_full_until(claude_usage_api(int(s)), now)
+        until = reset + AFTER_RESET if reset else now + CLAUDE_REST
+    t.setdefault('rest', {})[s] = until
+    log(f'seat {s} ({SEAT_NAMES[s]}) rests till {datetime.fromtimestamp(until):%d.%m %H:%M} ({outcome})')
 
 
 # ---------- tokens since the last reset ----------
@@ -710,21 +783,33 @@ def pid_alive(pid):
         return False
 
 
-def start_run(key, t):
+def start_run(key, t, seat='3'):
     RUNS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%m%d-%H%M%S')
-    out, last = RUNS / f'{key}-{stamp}.log', RUNS / f'{key}-{stamp}.last.txt'
-    cmd = [CODEX, 'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
-           '-C', t.get('cwd') or str(Path(t['plan']).parent), '-o', str(last), item_prompt(t)]
-    with open(out, 'w') as f:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
-    t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(),
+    n = t.get('runs', 0) + 1  # in the name too: a limited run and the next one can start within the same second
+    out, last = RUNS / f'{key}-{stamp}-{n}-s{seat}.log', RUNS / f'{key}-{stamp}-{n}-s{seat}.last.txt'
+    cwd = t.get('cwd') or str(Path(t['plan']).parent)
+    if seat == '3':
+        cmd = [CODEX, 'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
+               '-C', cwd, '-o', str(last), item_prompt(t)]
+        with open(out, 'w') as f:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+    else:
+        # claude -p prints only the final answer on stdout, so that's the .last file; the rest goes to the log.
+        # Account 1 is the default login: no CLAUDE_CONFIG_DIR at all (with it set to ~/.claude it says "Not logged in", 06.11)
+        env = {k: v for k, v in TOOL_ENV.items() if k != 'CLAUDE_CONFIG_DIR'}
+        if claude_dir(seat) != HOME / '.claude':
+            env['CLAUDE_CONFIG_DIR'] = str(claude_dir(seat))
+        cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions']
+        with open(out, 'w') as f, open(last, 'w') as fl:
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fl, stderr=f, start_new_session=True)
+    t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(), seat=seat,
              open_before=open_items(t['plan']), runs=t.get('runs', 0) + 1)
-    log(f'{key} run {t["runs"]} started, pid {p.pid}, open items {t["open_before"]}')
+    log(f'{key} run {t["runs"]} started on {SEAT_NAMES[seat]}, pid {p.pid}, open items {t["open_before"]}')
 
 
 def run_outcome(t):
-    """How the finished run ended: closed / item / damir / limited / failed."""
+    """How the finished run ended: closed / item / question / damir / limited / broken / failed."""
     try:
         last = Path(t['run_last']).read_text()
     except (OSError, KeyError):
@@ -743,8 +828,17 @@ def run_outcome(t):
         return 'damir'
     if ITEM_DONE in last:
         return 'item'
-    if 'usage limit' in tail or 'usage_limit' in tail:
+    import re
+    if (t.get('seat') or '3') == '3':
+        return 'limited' if 'usage limit' in tail or 'usage_limit' in tail else 'failed'
+    # claude -p: a limit or a dead login is the whole, short answer ("Claude AI usage limit reached",
+    # "You've hit your limit · resets 10pm", "Not logged in · Please run /login"). A long answer is real work
+    # that may well talk about some API's rate limit or an expired oauth token, so it doesn't count
+    short = (last if len(last) < 1000 else '').lower() + '\n' + tail[-2000:]
+    if re.search(r'usage limit|limit reached|hit your .{0,12}limit|out of (extra )?usage', short):
         return 'limited'
+    if re.search(r'not logged in|please run /login|invalid api key|oauth token (has )?expired', short):
+        return 'broken'
     return 'failed'
 
 
@@ -776,10 +870,8 @@ def tick_items(key, t, now, limits_ok):
             log(f'{key} paused: failures {t["failures"]}, no progress {t["no_progress"]}')
             notify('Дежурный: застрял', f'{name} — поставил на паузу, глянь журнал')
             return
-        if outcome == 'limited':
-            t['last_state'] = 'limited'
-            notify('Дежурный: лимит', f'{name} — жду сброса')
-            return
+        if outcome in ('limited', 'broken'):
+            rest_seat(t, t.get('seat') or '3', outcome, now)  # and straight on to the next seat below
     if t.get('waiting'):
         return
     if open_items(t['plan']) == 0:
@@ -789,15 +881,13 @@ def tick_items(key, t, now, limits_ok):
         t['done'], t['last_state'] = True, 'done'
         notify('Дежурный: план закрыт', name)
         return
-    # exec said "limit" but the app-server can still say allowed for a bit (02.11: 4 restarts in 4 min),
-    # so after a limited run trust exec and hold off for a while before asking again
-    if t.get('last_outcome') == 'limited' and now - (t.get('state_at') or 0) < LIMITS_EVERY:
+    seat = pick_seat(t, now, limits_ok)
+    if not seat:
+        if t.get('last_state') != 'limited':
+            notify('Дежурный: лимит', f'{name} — все включённые места в лимите, жду сброса')
         t['last_state'] = 'limited'
         return
-    if not limits_ok():
-        t['last_state'] = 'limited'
-        return
-    start_run(key, t)
+    start_run(key, t, seat)
     t['last_state'] = 'running'
 
 
@@ -997,6 +1087,8 @@ def main():
     cs = sub.add_parser('carousel-start', help='carousel of accounts for the claude session with this id (from /status)')
     cs.add_argument('sid')
     cx = sub.add_parser('carousel-stop'); cx.add_argument('sid')
+    se = sub.add_parser('seat', help='1 = Claude 1, 2 = Claude 2, 3 = Codex: may item runs and the carousel use it')
+    se.add_argument('n', choices=SEATS); se.add_argument('state', choices=('on', 'off'))
     args = ap.parse_args()
 
     if args.cmd == 'daemon':
@@ -1016,6 +1108,10 @@ def main():
         return
     if args.cmd == 'carousel-stop':
         carousel_stop(args.sid)
+        return
+    if args.cmd == 'seat':
+        set_seat(args.n, args.state == 'on')
+        print(f'{SEAT_NAMES[args.n]}: {"включён" if args.state == "on" else "выключен"}')
         return
     if args.cmd == 'mac-mode':
         set_mac_mode(args.mode)
@@ -1106,9 +1202,11 @@ def main():
             state = ('paused' if t.get('paused') else 'done' if t.get('done') else 'idle' if t.get('waiting')
                      else {'stuck': 'paused'}.get(t.get('last_state'), t.get('last_state') or 'idle'))
             rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'), 'state': state,
+                         'seat': SEAT_NAMES.get(t.get('seat') or '3'),
                          'state_at': t.get('state_at') or t.get('run_started'), 'wakes': t.get('runs', 0), 'loaded': False,
                          'open_thread': data.get('questions_thread'), 'pending': open_items(t['plan'], '?') or 0,
-                         'last_msg': f'запусков {t.get("runs", 0)}, открытых пунктов {open_items(t["plan"])}, '
+                         'last_msg': f'запусков {t.get("runs", 0)}, место {SEAT_NAMES.get(t.get("seat") or "3")}, '
+                                     f'открытых пунктов {open_items(t["plan"])}, '
                                      f'последний: {t.get("last_outcome") or "—"}, журнал {t.get("run_log") or "—"}'})
             continue
         st = thread_state(tid)
@@ -1126,7 +1224,8 @@ def main():
         f = lambda w: f'{w["usedPercent"]}% до {datetime.fromtimestamp(w["resetsAt"]):%d.%m %H:%M}' if w else '—'
         print(f'Лимиты: 5ч {f(lim["primary"])}, неделя {f(lim["secondary"])}, бесплатных сбросов {lim.get("free_resets")}')
     for r in rows:
-        print(f'{r["state"]:8} {r["name"]:30} {r["mode"]:11} будил {r["wakes"]}×  {r["id"]}')
+        print(f'{r["state"]:8} {r["name"]:30} {r["mode"]:11} будил {r["wakes"]}×  {r["id"]}'
+              + (f'  · {r["seat"]}' if r.get('seat') else ''))
     if not rows:
         print('На дежурстве никого.')
 

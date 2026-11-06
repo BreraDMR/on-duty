@@ -41,6 +41,10 @@ Codex stops when a limit runs out and doesn't continue by itself after the reset
   `codex exec` without history. The plan file is the only memory between runs. A run ends with one of four marker
   lines: item done, item parked with a question (`- [?]`, the duty goes on), stop and wait for you, plan closed.
   Questions go to one Codex chat you pick as the "questions chat".
+  Each run goes to the first free seat, in this order: Codex, Claude Code account 1, Claude Code account 2
+  (`claude -p`, a second account is the one with its own `CLAUDE_CONFIG_DIR`). A seat that hits its limit rests
+  until its reset and the same item moves on to the next one. Every seat has its own on/off switch in the window
+  (or `codex_wake.py seat 1|2|3 on|off`), shared with the account carousel.
 
 Hard stops are written into every prompt: production writes, text sent on your behalf, money, deleting what can't
 be restored.
