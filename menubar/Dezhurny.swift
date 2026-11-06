@@ -16,6 +16,7 @@ struct Thread: Decodable, Identifiable {
     let id: String; let name: String?; let mode: String?; let plan: String?
     let state: String; let state_at: Double?; let wakes: Int; let last_msg: String?
     let open_thread: String?; let pending: Int?  // item-by-item duty: the questions chat, items parked for Damir
+    let seat: String?                            // item-by-item duty: where the last run went (Codex / Claude 1 / Claude 2)
 }
 struct ClaudeWindow: Decodable { let usedPercent: Double?; let resetsAt: Double?; let resetPassed: Bool? }
 struct ClaudeAccount: Decodable, Identifiable {
@@ -191,8 +192,8 @@ struct Block<Content: View>: View {
 
 func stateText(_ t: Thread) -> String {
     switch t.state {
-    case "running": return "работает"
-    case "limited": return "ждёт сброса лимита"
+    case "running": return t.seat.map { "работает · \($0)" } ?? "работает"
+    case "limited": return t.seat != nil ? "все места в лимите, ждёт сброса" : "ждёт сброса лимита"
     case "idle": return "ждёт тебя"
     case "done": return "план закрыт"
     case "paused": return "на паузе"
@@ -327,9 +328,14 @@ struct PanelView: View {
         Block(title: "Карусель аккаунтов") {
             if let c = m.status?.carousel {
                 HStack(spacing: 10) {
+                    // each seat is its own switch: off = neither the duty nor the session carousel goes there
                     ForEach([("1", "Claude 1"), ("2", "Claude 2"), ("3", "Codex")], id: \.0) { k, name in
-                        Label(name, systemImage: c.seats[k] == true ? "circle.fill" : "circle")
-                            .font(.caption).foregroundStyle(c.seats[k] == true ? .green : .secondary)
+                        let on = c.seats[k] == true
+                        Button { m.cmd(["seat", k, on ? "off" : "on"]) } label: {
+                            Label(name, systemImage: on ? "circle.fill" : "circle")
+                                .font(.caption).foregroundStyle(on ? .green : .secondary)
+                        }
+                        .buttonStyle(.borderless).help(on ? "Выключить \(name)" : "Включить \(name)")
                     }
                 }
                 ForEach(c.watchers) { w in
@@ -447,8 +453,8 @@ struct HelpView: View {
             item("Лимиты", "Полоски «5 ч» и «нед» у Codex и обоих аккаунтов Claude. Зелёный — до 70 %, жёлтый — до 90 %, красный — дальше. Справа — когда сброс. Токены на это не тратятся. «данные N назад» — цифры давно не обновлялись (у аккаунта протух вход — открой в нём сессию).")
             item("Токены", "Под лимитами — сколько токенов ушло с последнего сброса, по журналам на этом маке. «Новых» — без повторного чтения кэша (это история переписки, которую модель перечитывает каждый шаг, её обычно ~98 %). Оба Claude считаются вместе — их журналы лежат в одной папке; окна — по Claude 1. Чат claude.ai сюда не попадает.")
             item("Мак", "Обычный — мак засыпает как всегда, дежурный его не держит. Пока дежурство — не даёт уснуть, пока кто-то на дежурстве. До 8:00 — не даёт уснуть до утра, потом сам вернётся в «Обычный». На батарее ниже 25 % мак отпускается в любом режиме. Экран гаснет как обычно. «Не дают уснуть» — кто сейчас держит мак.")
-            item("Карусель аккаунтов", "В нужной сессии Claude набери /status, скопируй ID сессии, вставь в поле и нажми «Запустить». Когда лимит аккаунта кончится, переписка сама переедет на другой Claude или в Codex — включены все три места. Пока карусель работает, мак не спит. «Стоп» у сессии — выключить.")
-            item("Дежурства", "Поставить: в чате Codex «на дежурство, план — <файл>». Вопросы дежурного приходят в чат «Дежурный: вопросы» в Codex, наверху окна тогда оранжевая плашка — нажми, откроется чат. «…» у дежурства — план, пауза, снять.")
+            item("Карусель аккаунтов", "В нужной сессии Claude набери /status, скопируй ID сессии, вставь в поле и нажми «Запустить». Когда лимит аккаунта кончится, переписка сама переедет на другой Claude или в Codex. Кружки Claude 1 / Claude 2 / Codex — выключатели мест: нажми, чтобы выключить или включить. Выключенное место не берут ни карусель, ни дежурный. Пока карусель работает, мак не спит. «Стоп» у сессии — выключить.")
+            item("Дежурства", "Поставить: в чате Codex «на дежурство, план — <файл>». Дежурство по пунктам берёт для каждого пункта первое свободное включённое место: сначала Codex, потом Claude 1, потом Claude 2; кто сейчас работает — видно под названием. Вопросы дежурного приходят в чат «Дежурный: вопросы» в Codex, наверху окна тогда оранжевая плашка — нажми, откроется чат. «…» у дежурства — план, пауза, снять.")
             item("Кнопки внизу", "Обновить лимиты · журнал сторожа · проверить уведомление · пауза всем дежурствам · сторож вкл/выкл (выключенный никого не будит и мак не держит) · эта инструкция · закрыть значок (открыть снова — Cmd+Пробел → «Дежурный»).")
         }
     }
