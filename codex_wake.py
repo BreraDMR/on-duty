@@ -750,13 +750,50 @@ def open_items(plan, mark=' '):
         return None
 
 
+def handover_text(t):
+    """The previous run on this same item got cut off by a limit: tell the next one where it stopped."""
+    h = t.get('handover')
+    if not h:
+        return ''
+    when = datetime.fromtimestamp(h['at']).strftime('%H:%M')
+    tail = f' Хвост его журнала — `{h["tail"]}`, читай только его, не весь журнал.' if h.get('tail') else ''
+    return (f'ВНИМАНИЕ: этот пункт уже начинал поток на месте «{h["seat"]}», его оборвал лимит в {when}. '
+            'Не начинай пункт заново: прочитай строки «ход:» под пунктом, в рабочей папке из последнего хода сделай '
+            '`git status` и `git diff` и продолжай с того места.' + tail +
+            ' Проверку, которая в ходе записана зелёной на том же коммите и без правок после, не перезапускай. ')
+
+
+HANDOVER_MIN_RUN = 180   # a run cut off sooner than this did nothing worth handing over (limit hit right at start)
+HANDOVER_TAIL = 120      # lines of the cut-off Codex log kept for the next run
+
+
+def save_handover(key, t, now):
+    """Remember that this run died mid-item. Codex logs every command, so keep its tail;
+    claude -p only prints the final answer, there the ход lines in the plan have to do."""
+    h = {'at': now, 'seat': SEAT_NAMES.get(t.get('seat') or '3', t.get('seat')), 'log': t.get('run_log')}
+    if (t.get('seat') or '3') == '3':
+        try:
+            lines = Path(t['run_log']).read_text(errors='replace').splitlines()[-HANDOVER_TAIL:]
+            tail = RUNS / f'{key}-handover.txt'
+            tail.write_text('\n'.join(lines) + '\n')
+            h['tail'] = str(tail)
+        except (OSError, KeyError):
+            pass
+    t['handover'] = h
+    log(f'{key} run {t.get("runs")} cut off mid-item, handover saved')
+
+
 def item_prompt(t):
     return (f'[Дежурный, новый поток] План: `{t["plan"]}`. Ты свежий поток без истории: всё, что нужно, — в плане. '
             'Прочитай шапку плана до первого пункта и раздел «Экономия», затем возьми ПЕРВЫЙ пункт `- [ ]` сверху и '
             'сделай только его; читай только то, что названо в его строке «Читать». '
+            f'{handover_text(t)}'
+            'Подагентов, форков и параллельных агентов не запускай: пункт делаешь сам, в этом потоке; долгие прогоны — '
+            'в фоне с выводом в файл. '
             f'{MODE_RULES.get(t.get("mode"), MODE_RULES["review"])} {HARD_STOPS} '
             'По ходу пиши под пунктом строку «  - ход: …» (что сделано, что дальше), чтобы следующий поток продолжил, '
-            'если тебя оборвёт лимит. '
+            'если тебя оборвёт лимит: после каждого коммита и каждого прогона проверок — с результатом и коммитом '
+            '(например «unit 270 ok @ 11cb2a3»), а рабочую папку пиши в ход полным путём. '
             f'Пункт закрыт → отметь `- [x]` с итогом одной строкой, закоммить и закончи ответ строкой {ITEM_DONE}. '
             'Пункт нельзя закрыть без решения Дамира, но следующие пункты от него не зависят → запиши вопрос в «На решение Дамиру», '
             f'поменяй отметку пункта на `- [?]` и закончи строкой {ITEM_QUESTION}: дежурство пойдёт дальше, Дамир ответит позже. '
@@ -790,8 +827,9 @@ def start_run(key, t, seat='3'):
     out, last = RUNS / f'{key}-{stamp}-{n}-s{seat}.log', RUNS / f'{key}-{stamp}-{n}-s{seat}.last.txt'
     cwd = t.get('cwd') or str(Path(t['plan']).parent)
     if seat == '3':
+        # no subagents in item runs: on 06.11 they ate a third of the tokens and the item is a fresh session anyway
         cmd = [CODEX, 'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
-               '-C', cwd, '-o', str(last), item_prompt(t)]
+               '--disable', 'multi_agent', '-C', cwd, '-o', str(last), item_prompt(t)]
         with open(out, 'w') as f:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
     else:
@@ -800,7 +838,8 @@ def start_run(key, t, seat='3'):
         env = {k: v for k, v in TOOL_ENV.items() if k != 'CLAUDE_CONFIG_DIR'}
         if claude_dir(seat) != HOME / '.claude':
             env['CLAUDE_CONFIG_DIR'] = str(claude_dir(seat))
-        cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions']
+        cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions',
+               '--disallowedTools', 'Agent,Workflow']
         with open(out, 'w') as f, open(last, 'w') as fl:
             p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fl, stderr=f, start_new_session=True)
     t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(), seat=seat,
@@ -853,6 +892,8 @@ def tick_items(key, t, now, limits_ok):
         opened = open_items(t['plan'])
         progressed = opened is not None and t.get('open_before') is not None and opened < t['open_before']
         t.update(run_pid=None, last_outcome=outcome, state_at=now)
+        if outcome in ('item', 'question', 'damir', 'closed'):
+            t.pop('handover', None)  # the item moved on, nothing left to hand over
         log(f'{key} run {t.get("runs")} ended: {outcome}, open items {t.get("open_before")} -> {opened}')
         t['no_progress'] = 0 if progressed else t.get('no_progress', 0) + (outcome in ('item', 'failed', 'question'))
         t['failures'] = t.get('failures', 0) + 1 if outcome == 'failed' else 0
@@ -870,6 +911,8 @@ def tick_items(key, t, now, limits_ok):
             log(f'{key} paused: failures {t["failures"]}, no progress {t["no_progress"]}')
             notify('Дежурный: застрял', f'{name} — поставил на паузу, глянь журнал')
             return
+        if outcome == 'limited' and now - t.get('run_started', now) > HANDOVER_MIN_RUN:
+            save_handover(key, t, now)  # it got some way into the item: the next seat picks up from there
         if outcome in ('limited', 'broken'):
             rest_seat(t, t.get('seat') or '3', outcome, now)  # and straight on to the next seat below
     if t.get('waiting'):
