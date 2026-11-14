@@ -961,6 +961,15 @@ def ask_damir(key, t, outcome):
         if sent and not loaded_in_app(qid):
             open_in_app(qid)
     log(f'{key} question ({outcome}) -> {"chat " + qid if sent else "no chat, notification only"}')
+    # a copy to Telegram too, so the question reaches the phone and any session (Claude or Codex) can answer it
+    try:
+        import tg_notify
+        tg_ok, tg_err = tg_notify.send(
+            f'[Дежурный · вопрос] {t.get("name") or key}: {stop}.\n\n{question}\n\n'
+            f'Ответ — в любой сессии Claude или Codex: «ответ дежурному: …». План: {t["plan"]}, запись `{key}`.')
+        log(f'{key} question -> telegram {"ok" if tg_ok else "failed: " + tg_err}')
+    except Exception as e:  # telegram is a bonus, never let it break the watcher
+        log(f'{key} question -> telegram error {e!r}')
     notify('Дежурный: вопрос', f'{t.get("name") or key} — ответь в чате «Дежурный: вопросы»' if sent
            else f'{t.get("name") or key} — вопрос в плане, чат вопросов не задан')
 
