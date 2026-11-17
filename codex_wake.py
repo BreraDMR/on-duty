@@ -414,9 +414,20 @@ def claude_full_until(usage, now):
 def pick_seat(t, now, limits_ok):
     """First seat that is switched on, not resting after a limit and has room. Resting seats are written to t['rest']."""
     rest = t.setdefault('rest', {})
-    for s in SEATS:
-        if not seat_on(s) or rest.get(s, 0) > now:
+    # a duty can ask for its own seat order (Damir 17.11: his relay goes to Claude 2 first, the rest only when it's full)
+    for s in (t.get('seat_order') or SEATS):
+        if not seat_on(s):
             continue
+        if rest.get(s, 0) > now:
+            # a long Claude rest comes from a "full" window; the window can reset early (17.11: weekly limit of
+            # Claude 2 came back days before resets_at), so if the fresh usage shows room, drop the rest.
+            # Short rests (a run just said "limit" without a reset time) are kept, otherwise we'd loop on it.
+            long_rest = rest[s] - now > 2 * CLAUDE_REST
+            if not (s != '3' and long_rest and claude_dir(s)
+                    and not claude_full_until((claude_usage_cached().get('accounts') or {}).get(s), now)):
+                continue
+            log(f'seat {s} ({SEAT_NAMES[s]}) has room again before its rest ended, back in')
+            rest.pop(s, None)
         if s == '3':
             if limits_ok():
                 return s
@@ -1130,6 +1141,8 @@ def main():
     sub.add_parser('test-notify')
     for c in ('remove', 'pause', 'resume'):
         sub.add_parser(c).add_argument('thread')
+    so = sub.add_parser('seat-order', help='which seats this duty tries first, e.g. 2,3,1; "default" drops it')
+    so.add_argument('thread'); so.add_argument('order')
     sub.add_parser('list'); s = sub.add_parser('status'); s.add_argument('--json', action='store_true')
     sub.add_parser('limits')
     w = sub.add_parser('wake'); w.add_argument('thread'); w.add_argument('--force', action='store_true')
@@ -1224,6 +1237,21 @@ def main():
                         data['threads'][k].update(done=False, waiting=False, failures=0, no_progress=0)
         log(f'{args.cmd} {", ".join(keys)}')
         print(f'{args.cmd}: {", ".join(keys)}')
+        return
+    if args.cmd == 'seat-order':
+        order = None if args.order == 'default' else tuple(x.strip() for x in args.order.split(','))
+        if order and (len(set(order)) != len(order) or not set(order) <= set(SEATS)):
+            sys.exit(f'порядок мест — через запятую из {",".join(SEATS)}, например 2,3,1')
+        with watch_list() as data:
+            keys = list(data['threads']) if args.thread == 'all' else [resolve(data, args.thread)]
+            for k in keys:
+                if order:
+                    data['threads'][k]['seat_order'] = list(order)
+                else:
+                    data['threads'][k].pop('seat_order', None)
+        shown = ' → '.join(SEAT_NAMES[x] for x in order) if order else 'обычный'
+        log(f'seat order {",".join(order) if order else "default"} for {", ".join(keys)}')
+        print(f'порядок мест ({shown}): {", ".join(keys)}')
         return
     if args.cmd == 'wake':
         data = read_watch()
