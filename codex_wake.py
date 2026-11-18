@@ -203,11 +203,11 @@ def app_server_call(method, params=None, timeout=30, then=None):
 
 def read_limits():
     """No tokens spent: the same numbers the app shows in its usage panel."""
-    r = app_server_call('account/rateLimits/read')
+    r = app_server_call('account/rateLimits/read') or {}
     rl = r.get('rateLimits') or {}
     out = {'allowed': bool(r.get('ordinaryUsageAllowed')), 'checked_at': time.time(),
            'primary': rl.get('primary'), 'secondary': rl.get('secondary'),
-           'free_resets': len([c for c in (r.get('rateLimitResetCredits') or {}).get('credits', [])
+           'free_resets': len([c for c in (r.get('rateLimitResetCredits') or {}).get('credits') or []
                                if c.get('status') == 'available'])}
     STATE.mkdir(parents=True, exist_ok=True)
     LIMITS_CACHE.write_text(json.dumps(out, indent=2))
