@@ -961,6 +961,22 @@ def want_filler(key, seat, now):
     return True
 
 
+def reap_group(key, pid):
+    """The run had its own session (start_new_session), so its group id is its pid. Whatever it left in the
+    background (php -S, npm run dev, playwright, mcp servers) dies with it instead of hanging around till reboot."""
+    try:
+        left = subprocess.run(['pgrep', '-g', str(pid)], capture_output=True, text=True, timeout=10).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if not left:
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        log(f'{key}: run left {len(left)} process(es) behind, sent them SIGTERM')
+    except OSError as e:
+        log(f'{key}: could not stop leftovers of run pid {pid}: {e}')
+
+
 def tick_items(key, t, now, limits_ok):
     """One step for an items entry. limits_ok() reads limits (no tokens) only when a run is about to start."""
     name = t.get('name') or key
@@ -968,6 +984,7 @@ def tick_items(key, t, now, limits_ok):
         t['last_state'] = 'running'
         return
     if t.get('run_pid'):  # a run just finished
+        reap_group(key, t['run_pid'])
         outcome = run_outcome(t)
         opened = open_items(t['plan'])
         progressed = opened is not None and t.get('open_before') is not None and opened < t['open_before']
