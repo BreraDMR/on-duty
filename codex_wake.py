@@ -154,7 +154,9 @@ def thread_state(tid):
     return {'state': 'idle', 'at': at, 'msg': msg}
 
 
-def app_server_call(method, params=None, timeout=30):
+def app_server_call(method, params=None, timeout=30, then=None):
+    """One request to a throwaway app-server. `then(result)` may return (method, params) for a follow-up
+    request in the same process; the follow-up's result is ignored, the first one is returned."""
     p = subprocess.Popen([CODEX, 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, text=True, bufsize=1)
     try:
@@ -183,7 +185,12 @@ def app_server_call(method, params=None, timeout=30):
         wait(1)
         send({'method': 'initialized'})
         send({'id': 2, 'method': method, 'params': params})
-        return wait(2)
+        result = wait(2)
+        nxt = then(result) if then else None
+        if nxt:
+            send({'id': 3, 'method': nxt[0], 'params': nxt[1]})
+            wait(3)
+        return result
     finally:
         p.terminate()
         try:
@@ -946,7 +953,17 @@ def tick_items(key, t, now, limits_ok):
 
 
 def questions_thread():
+    """Old single questions chat. Only a fallback now, when a fresh chat can't be made."""
     return read_watch().get('questions_thread')
+
+
+def new_question_chat(title):
+    """A fresh Codex chat for every question (Damir 18.11). One shared chat lived from 02.11 to 18.11,
+    piled up 50M input tokens and a compaction, and Codex in it got slow and confused.
+    thread/start costs no tokens; the chat shows up in the app once opened by codex://threads/<id>."""
+    r = app_server_call('thread/start', {'cwd': str(HOME)},
+                        then=lambda r: ('thread/name/set', {'threadId': r['thread']['id'], 'name': title}))
+    return r['thread']['id']
 
 
 # the owner's own skill if there is one next to the code, else the example from the repo
@@ -965,7 +982,12 @@ def ask_damir(key, t, outcome):
            f'Для тебя, Codex: перескажи Дамиру этот вопрос коротко по-русски и жди его ответа, сам ничего не решай. '
            f'Когда ответит — сделай по разделу «Чат вопросов» в `{SKILL_FILE}` (прочитай его): '
            f'план `{t["plan"]}`, запись дежурства `{key}`.')
-    qid = questions_thread()
+    try:
+        qid = new_question_chat(f'❓ {t.get("name") or key} · {datetime.now():%d.%m %H:%M}')
+        t['question_thread'] = qid
+    except Exception as e:  # app-server hiccup: fall back to the old shared chat if there is one
+        log(f'{key} new question chat failed: {e!r}')
+        qid = questions_thread()
     sent = False
     if qid:
         sent = queue_message(qid, msg)
@@ -981,7 +1003,7 @@ def ask_damir(key, t, outcome):
         log(f'{key} question -> telegram {"ok" if tg_ok else "failed: " + tg_err}')
     except Exception as e:  # telegram is a bonus, never let it break the watcher
         log(f'{key} question -> telegram error {e!r}')
-    notify('Дежурный: вопрос', f'{t.get("name") or key} — ответь в чате «Дежурный: вопросы»' if sent
+    notify('Дежурный: вопрос', f'{t.get("name") or key} — ответь в новом чате «❓ {t.get("name") or key}» в Codex' if sent
            else f'{t.get("name") or key} — вопрос в плане, чат вопросов не задан')
 
 
@@ -1136,7 +1158,7 @@ def main():
     ai = sub.add_parser('add-items', help='plan run item by item, a fresh codex exec per item')
     ai.add_argument('--plan', required=True); ai.add_argument('--name'); ai.add_argument('--cwd')
     ai.add_argument('--mode', choices=list(MODE_RULES), default='review')
-    qc = sub.add_parser('questions-chat', help='this Codex chat gets the questions of item runs')
+    qc = sub.add_parser('questions-chat', help='fallback chat for questions, used only if a fresh chat per question cannot be made')
     qc.add_argument('thread', nargs='?', default=os.environ.get('CODEX_THREAD_ID'))
     sub.add_parser('test-notify')
     for c in ('remove', 'pause', 'resume'):
@@ -1284,7 +1306,7 @@ def main():
             rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'), 'state': state,
                          'seat': SEAT_NAMES.get(t.get('seat') or '3'),
                          'state_at': t.get('state_at') or t.get('run_started'), 'wakes': t.get('runs', 0), 'loaded': False,
-                         'open_thread': data.get('questions_thread'), 'pending': open_items(t['plan'], '?') or 0,
+                         'open_thread': t.get('question_thread') or data.get('questions_thread'), 'pending': open_items(t['plan'], '?') or 0,
                          'last_msg': f'запусков {t.get("runs", 0)}, место {SEAT_NAMES.get(t.get("seat") or "3")}, '
                                      f'открытых пунктов {open_items(t["plan"])}, '
                                      f'последний: {t.get("last_outcome") or "—"}, журнал {t.get("run_log") or "—"}'})
