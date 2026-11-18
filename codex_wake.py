@@ -46,7 +46,9 @@ MODE_RULES = {
                     'и записывай каждое такое решение одной строкой в журнал решений (DECISIONS-dezhurstvo.md рядом с планом) — '
                     'Дамир просмотрит их потом разом.'),
 }
-HARD_STOPS = ('Без Дамира не делай и остановись с вопросом: запись в прод, текст наружу от его имени, '
+HARD_STOPS = ('Без Дамира не делай и остановись с вопросом: запись в прод janoshik (прод Xtrix — можно всё, Дамир 18.11), текст наружу от его имени '
+              '(это личное сообщение или письмо человеку с просьбой; push, PR, мерж и их описания в репо Xtrix — '
+              'не текст наружу, их делай сам, включая force; комментарии учителям в Classroom Глеба — тоже сам, Дамир 18.11), '
               'деньги, удаление того, что не восстановить.')
 
 
@@ -385,6 +387,7 @@ SEATS = ('3', '1', '2')  # Codex first so Claude stays free for live sessions, t
 SEAT_NAMES = {'1': 'Claude 1', '2': 'Claude 2', '3': 'Codex'}
 SEAT_OFF = {'1': 'off-account1', '2': 'off-account2', '3': 'off-codex'}
 CLAUDE_BIN = HOME / '.local/bin/claude'
+SEAT_TOKENS = HOME / '.config/claude-oauth'   # seatN-*.token from claude setup-token, chmod 600, not in git
 CLAUDE_FULL = 97        # a Claude window this full counts as gone, the run would just die on it
 CLAUDE_REST = 900       # a Claude seat that said "limit" but gave no reset time rests this long
 BROKEN_REST = 3600      # "not logged in" and the like: nothing to retry every minute
@@ -815,7 +818,9 @@ def item_prompt(t):
             f'Пункт закрыт → отметь `- [x]` с итогом одной строкой, закоммить и закончи ответ строкой {ITEM_DONE}. '
             'Пункт нельзя закрыть без решения Дамира, но следующие пункты от него не зависят → запиши вопрос в «На решение Дамиру», '
             f'поменяй отметку пункта на `- [?]` и закончи строкой {ITEM_QUESTION}: дежурство пойдёт дальше, Дамир ответит позже. '
-            f'Дальше вообще нельзя (стоп-точка: прод, деньги, текст наружу, удаление) → закончи строкой {NEED_DAMIR}. '
+            'Стоп-точка в этом пункте (прод, деньги, текст наружу, удаление) — это тоже `- [?]` и вопрос в «На решение Дамиру», '
+            f'а в конце {ITEM_QUESTION}, если хоть один следующий пункт можно делать без этого ответа: один вопрос не останавливает '
+            f'весь план (Дамир 18.11). {NEED_DAMIR} — только если без ответа не может идти ни один открытый пункт. '
             'В обоих случаях с вопросом сам вопрос напиши в последнем ответе: 1–3 предложения по-русски простыми словами, '
             'твоя рекомендация, номер пункта — этот текст уйдёт Дамиру в чат вопросов. '
             f'Это последний пункт («весь план пройден»), а в плане остались `- [?]` → не закрывай его, закончи строкой {NEED_DAMIR}. '
@@ -856,13 +861,24 @@ def start_run(key, t, seat='3'):
         env = {k: v for k, v in TOOL_ENV.items() if k != 'CLAUDE_CONFIG_DIR'}
         if claude_dir(seat) != HOME / '.claude':
             env['CLAUDE_CONFIG_DIR'] = str(claude_dir(seat))
+        # long-lived setup-token, so the run doesn't die when the normal login expires (Damir, 17.11)
+        tok = next(SEAT_TOKENS.glob(f'seat{seat}-*.token'), None)
+        if tok:
+            env['CLAUDE_CODE_OAUTH_TOKEN'] = tok.read_text().strip()
         cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions',
                '--disallowedTools', 'Agent,Workflow']
         with open(out, 'w') as f, open(last, 'w') as fl:
             p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fl, stderr=f, start_new_session=True)
     t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(), seat=seat,
-             open_before=open_items(t['plan']), runs=t.get('runs', 0) + 1)
+             open_before=open_items(t['plan']), plan_size_before=plan_size(t['plan']), runs=t.get('runs', 0) + 1)
     log(f'{key} run {t["runs"]} started on {SEAT_NAMES[seat]}, pid {p.pid}, open items {t["open_before"]}')
+
+
+def plan_size(plan):
+    try:
+        return os.path.getsize(plan)
+    except (OSError, TypeError):
+        return None
 
 
 def run_outcome(t):
@@ -877,14 +893,12 @@ def run_outcome(t):
             tail = f.read().decode('utf-8', 'replace').lower()
     except (OSError, KeyError):
         tail = ''
-    if DONE_MARK in last:
-        return 'closed'
-    if ITEM_QUESTION in last:
-        return 'question'
-    if NEED_DAMIR in last:
-        return 'damir'
-    if ITEM_DONE in last:
-        return 'item'
+    # only the closing line counts: on 17.11 a run quoted "ПЛАН ЗАКРЫТ" mid-answer, ended with ПУНКТ ГОТОВ, and got closed
+    lines = [l.strip(' *`') for l in last.strip().splitlines() if l.strip()]
+    end = lines[-1] if lines else ''
+    for mark, outcome in ((DONE_MARK, 'closed'), (ITEM_QUESTION, 'question'), (NEED_DAMIR, 'damir'), (ITEM_DONE, 'item')):
+        if mark in end:
+            return outcome
     import re
     if (t.get('seat') or '3') == '3':
         return 'limited' if 'usage limit' in tail or 'usage_limit' in tail else 'failed'
@@ -899,6 +913,47 @@ def run_outcome(t):
     return 'failed'
 
 
+# ---------- priorities: top plans first, the rest only to fill the window (Damir 18.11) ----------
+# Priority 1 plans always run. Lower ones start only when the top ones won't use up the 5-hour window by its reset:
+# then one more filler goes in, at most one per seat every FILL_GAP. Goal: every window burned to 100 %.
+FILL_GAP = 600
+PACE_MIN_ELAPSED = 1200   # too early in a window to judge the pace, let the top plans set it
+FILL_LAST = {}
+THREADS_NOW = {}
+
+
+def seat_window(seat):
+    """(used %, resets_at, window seconds) of the 5-hour window of a seat, Nones when unknown."""
+    if seat == '3':
+        try:
+            p = json.loads(LIMITS_CACHE.read_text()).get('primary') or {}
+        except (OSError, ValueError):
+            return None, None, None
+        return p.get('usedPercent'), p.get('resetsAt'), (p.get('windowDurationMins') or 300) * 60
+    w = ((claude_usage_cached().get('accounts') or {}).get(seat) or {}).get('five_hour') or {}
+    return w.get('used_percentage'), w.get('resets_at'), 300 * 60
+
+
+def want_filler(key, seat, now):
+    """May a lower-priority plan start a run on this seat right now?"""
+    top_here = any(pid_alive(x.get('run_pid')) and x.get('seat') == seat
+                   for x in THREADS_NOW.values() if x.get('priority', 2) <= 1)
+    if not top_here:
+        return True   # nothing important on this seat, the window would just idle
+    used, reset, length = seat_window(seat)
+    if used is None or not reset or reset <= now:
+        return True
+    elapsed = now - (reset - length)
+    if elapsed < PACE_MIN_ELAPSED:
+        return False
+    projected = used + used / max(elapsed, 1) * (reset - now)
+    if projected >= 100 or now - FILL_LAST.get(seat, 0) < FILL_GAP:
+        return False
+    FILL_LAST[seat] = now
+    log(f'{key}: seat {seat} at {used:.0f} %, pace says {projected:.0f} % by reset, adding a filler')
+    return True
+
+
 def tick_items(key, t, now, limits_ok):
     """One step for an items entry. limits_ok() reads limits (no tokens) only when a run is about to start."""
     name = t.get('name') or key
@@ -909,6 +964,10 @@ def tick_items(key, t, now, limits_ok):
         outcome = run_outcome(t)
         opened = open_items(t['plan'])
         progressed = opened is not None and t.get('open_before') is not None and opened < t['open_before']
+        # a long item can take 2-3 runs; new progress lines in the plan count too, or it gets paused as stuck (17.11)
+        size = plan_size(t['plan'])
+        if not progressed and outcome == 'item' and size and t.get('plan_size_before') and size > t['plan_size_before'] + 40:
+            progressed = True
         t.update(run_pid=None, last_outcome=outcome, state_at=now)
         if outcome in ('item', 'question', 'damir', 'closed'):
             t.pop('handover', None)  # the item moved on, nothing left to hand over
@@ -943,6 +1002,9 @@ def tick_items(key, t, now, limits_ok):
         notify('Дежурный: план закрыт', name)
         return
     seat = pick_seat(t, now, limits_ok)
+    if seat and t.get('priority', 2) > 1 and not want_filler(key, seat, now):
+        t['last_state'] = 'held'   # waits for room in the window, the top plans go first
+        return
     if not seat:
         if t.get('last_state') != 'limited':
             notify('Дежурный: лимит', f'{name} — все включённые места в лимите, жду сброса')
@@ -1054,7 +1116,8 @@ def tick(caf, limits_box):
                     return False
             return lim['allowed']
 
-        for key, t in list(live.items()):
+        THREADS_NOW.clear(); THREADS_NOW.update(threads)
+        for key, t in sorted(live.items(), key=lambda kv: kv[1].get('priority', 2)):
             if t.get('kind') == 'items':
                 prev = t.get('last_state')
                 tick_items(key, t, now, limits_ok)
@@ -1163,6 +1226,8 @@ def main():
     sub.add_parser('test-notify')
     for c in ('remove', 'pause', 'resume'):
         sub.add_parser(c).add_argument('thread')
+    pr = sub.add_parser('priority', help='1 = always runs, 2+ = only fills the window when the top plans leave room')
+    pr.add_argument('thread'); pr.add_argument('n', type=int)
     so = sub.add_parser('seat-order', help='which seats this duty tries first, e.g. 2,3,1; "default" drops it')
     so.add_argument('thread'); so.add_argument('order')
     sub.add_parser('list'); s = sub.add_parser('status'); s.add_argument('--json', action='store_true')
@@ -1259,6 +1324,14 @@ def main():
                         data['threads'][k].update(done=False, waiting=False, failures=0, no_progress=0)
         log(f'{args.cmd} {", ".join(keys)}')
         print(f'{args.cmd}: {", ".join(keys)}')
+        return
+    if args.cmd == 'priority':
+        with watch_list() as data:
+            keys = list(data['threads']) if args.thread == 'all' else [resolve(data, args.thread)]
+            for k in keys:
+                data['threads'][k]['priority'] = args.n
+        log(f'priority {args.n} for {", ".join(keys)}')
+        print(f'приоритет {args.n}: {", ".join(keys)}')
         return
     if args.cmd == 'seat-order':
         order = None if args.order == 'default' else tuple(x.strip() for x in args.order.split(','))
