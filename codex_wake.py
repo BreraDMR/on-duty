@@ -881,6 +881,13 @@ def start_run(key, t, seat='3'):
     log(f'{key} run {t["runs"]} started on {SEAT_NAMES[seat]}, pid {p.pid}, open items {t["open_before"]}')
 
 
+def plan_mtime(plan):
+    try:
+        return os.path.getmtime(plan)
+    except (OSError, TypeError):
+        return None
+
+
 def plan_size(plan):
     try:
         return os.path.getsize(plan)
@@ -1254,7 +1261,8 @@ def main():
     qc.add_argument('thread', nargs='?', default=os.environ.get('CODEX_THREAD_ID'))
     sub.add_parser('test-notify')
     for c in ('remove', 'pause', 'resume'):
-        sub.add_parser(c).add_argument('thread')
+        sp = sub.add_parser(c); sp.add_argument('thread')
+        sp.add_argument('--force', action='store_true', help='resume even if the plan has no answer yet')
     pr = sub.add_parser('priority', help='1 = always runs, 2+ = only fills the window when the top plans leave room')
     pr.add_argument('thread'); pr.add_argument('n', type=int)
     so = sub.add_parser('seat-order', help='which seats this duty tries first, e.g. 2,3,1; "default" drops it')
@@ -1350,7 +1358,14 @@ def main():
                 else:
                     data['threads'][k]['paused'] = args.cmd == 'pause'
                     if args.cmd == 'resume':
-                        data['threads'][k].update(done=False, waiting=False, failures=0, no_progress=0)
+                        t = data['threads'][k]
+                        # 06.11 prod1: resumed a minute before the answer hit the plan, the same question came again
+                        if (t.get('waiting') and t.get('kind') == 'items' and not args.force and args.thread != 'all'
+                                and (plan_mtime(t['plan']) or 0) <= (t.get('state_at') or 0)):
+                            print(f'{k}: план не менялся после вопроса — сначала запиши ответ в план (или --force)')
+                            log(f'resume {k} refused: no answer in the plan yet')
+                            continue
+                        t.update(done=False, waiting=False, failures=0, no_progress=0)
         log(f'{args.cmd} {", ".join(keys)}')
         print(f'{args.cmd}: {", ".join(keys)}')
         return
