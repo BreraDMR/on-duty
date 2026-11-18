@@ -999,7 +999,7 @@ def tick_items(key, t, now, limits_ok):
             save_handover(key, t, now)  # it got some way into the item: the next seat picks up from there
         if outcome in ('limited', 'broken'):
             rest_seat(t, t.get('seat') or '3', outcome, now)  # and straight on to the next seat below
-    if t.get('waiting'):
+    if t.get('waiting') or t.get('paused'):   # paused: the finished run is booked, no new one
         return
     if open_items(t['plan']) == 0:
         if open_items(t['plan'], '?'):
@@ -1111,7 +1111,10 @@ def tick(caf, limits_box):
     with watch_list() as data:
         threads = data['threads']
         live = {k: v for k, v in threads.items() if not v.get('paused') and not v.get('done')}
-        caf.hold(should_hold(bool(live)))
+        # paused while a run still goes: keep the mac awake for it and still catch its end (17.11 02:02, 18.11 07:25)
+        paused_runs = {k: v for k, v in threads.items() if v.get('paused') and not v.get('done')
+                       and v.get('kind') == 'items' and v.get('run_pid')}
+        caf.hold(should_hold(bool(live) or any(pid_alive(v['run_pid']) for v in paused_runs.values())))
 
         def limits_ok():
             lim = limits_box.get('v')
@@ -1126,14 +1129,14 @@ def tick(caf, limits_box):
             return lim['allowed']
 
         THREADS_NOW.clear(); THREADS_NOW.update(threads)
-        for key, t in sorted(live.items(), key=lambda kv: kv[1].get('priority', 2)):
+        for key, t in sorted({**live, **paused_runs}.items(), key=lambda kv: kv[1].get('priority', 2)):
             if t.get('kind') == 'items':
                 prev = t.get('last_state')
                 tick_items(key, t, now, limits_ok)
                 if t.get('last_state') != prev:
                     log(f'{key} {prev} -> {t.get("last_state")}')
                     limits_box.pop('v', None) if t.get('last_state') in ('running', 'limited') else None
-                live.pop(key)
+                live.pop(key, None)
         need_limits = False
         for tid, t in live.items():
             st = thread_state(tid)
