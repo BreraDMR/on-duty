@@ -26,7 +26,8 @@ Click the moon in the menu bar, look, click away. No numbers in the menu bar its
 
   On battery below 25 % the Mac is let go in any mode. The display still sleeps as usual. Below the switch:
   who keeps the Mac awake right now (from `pmset -g assertions`).
-- **Duty threads** with their state, pause/resume/remove, and a banner when a question is waiting for you.
+- **Duty threads** with their state, a reason for running or waiting, pause/resume/remove, and questions you can
+  answer right in the window. Plans closed for more than 24 hours move into the collapsed **Готово** section.
 - A built-in help page (the book icon).
 
 ## On duty
@@ -40,7 +41,7 @@ Codex stops when a limit runs out and doesn't continue by itself after the reset
   history on every step and can burn a 5-hour window in minutes. Here every open `- [ ]` item of the plan gets a fresh
   `codex exec` without history. The plan file is the only memory between runs. A run ends with one of four marker
   lines: item done, item parked with a question (`- [?]`, the duty goes on), stop and wait for you, plan closed.
-  Questions go to one Codex chat you pick as the "questions chat".
+  Each question gets a new Codex chat; a configured "questions chat" is used only if creating a new chat fails.
   Each run goes to the first free seat, in this order: Codex, Claude Code account 1, Claude Code account 2
   (`claude -p`, a second account is the one with its own `CLAUDE_CONFIG_DIR`). A seat that hits its limit rests
   until its reset and the same item moves on to the next one. Every seat has its own on/off switch in the window
@@ -48,6 +49,31 @@ Codex stops when a limit runs out and doesn't continue by itself after the reset
 
 Hard stops are written into every prompt: production writes, text sent on your behalf, money, deleting what can't
 be restored.
+
+### Answers, history and scheduling reasons
+
+For an item-by-item duty, the window shows the last unanswered question from the plan's `На решение Дамиру`
+section. Click **Ответить**, enter your decision and save it. The command-line equivalent is:
+
+```sh
+python3 codex_wake.py answer DUTY_ID "Your exact decision"
+```
+
+Use the duty ID from `status`. The question must identify one parked `- [?]` item by number, or that item must be
+the only parked one. `answer` adds a dated decision under it, changes it to `- [ ]`, replaces the question with
+the answer, commits only the plan if it is under Git, and then resumes the duty. Empty answers, missing questions
+and ambiguous item references are rejected. The window also rejects an answer if the displayed question has
+changed. A failed commit prevents resuming; the original plan is restored unless it changed during the write.
+
+Completed plans stay in the main list for 24 hours after closure, then appear under **Готово**. They remain in
+the watch file; nothing is deleted. Text `status` replaces their individual rows with `готово: N`, while
+`status --json` puts them in `completed`. Repeating `add` or `add-items` for the same resolved plan path revives
+its existing entry, keeping its execution mode and any live run. Different paths remain separate entries.
+
+The watcher saves a `reason` on every tick. The window and `status` show why a duty is running or waiting:
+for a seat to reset, for your answer, because it is paused, or because a lower-priority plan is waiting for room.
+These reasons use the scheduling state and cached limits without extra API requests. After a watcher upgrade,
+new scheduling details appear after its restart and next tick.
 
 ## Install
 
