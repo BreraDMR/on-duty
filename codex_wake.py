@@ -421,23 +421,42 @@ def claude_full_until(usage, now):
     return None
 
 
+# Seat rests are shared by all plans (watch.json 'seat_rest'): on 17.11 Claude 2 rested in one plan and another
+# plan still started on it and hit the limit straight away. tick() points these two at the dicts in watch.json.
+SEAT_REST = {}
+SEAT_STRIKES = {}   # short "limit" rests in a row per seat, each one twice as long as the last
+
+
+def seat_rest(t, s):
+    return max((t.get('rest') or {}).get(s, 0), SEAT_REST.get(s, 0))
+
+
+def set_rest(t, s, until):
+    t.setdefault('rest', {})[s] = until
+    SEAT_REST[s] = until
+
+
 def pick_seat(t, now, limits_ok):
-    """First seat that is switched on, not resting after a limit and has room. Resting seats are written to t['rest']."""
-    rest = t.setdefault('rest', {})
+    """First seat that is switched on, not resting after a limit and has room. Rests go to the plan and to the shared list."""
     # a duty can ask for its own seat order (Damir 17.11: his relay goes to Claude 2 first, the rest only when it's full)
     for s in (t.get('seat_order') or SEATS):
         if not seat_on(s):
             continue
-        if rest.get(s, 0) > now:
+        if seat_rest(t, s) > now:
             # a long Claude rest comes from a "full" window; the window can reset early (17.11: weekly limit of
-            # Claude 2 came back days before resets_at), so if the fresh usage shows room, drop the rest.
+            # Claude 2 came back days before resets_at), so if the usage shows room, drop the rest.
+            # Asked fresh, not from the cache: on 17.11 20:24 the cache said "room" five times in a row and
+            # every run died on the weekly limit. No answer at all = don't know = keep resting.
             # Short rests (a run just said "limit" without a reset time) are kept, otherwise we'd loop on it.
-            long_rest = rest[s] - now > 2 * CLAUDE_REST
-            if not (s != '3' and long_rest and claude_dir(s)
-                    and not claude_full_until((claude_usage_cached().get('accounts') or {}).get(s), now)):
+            long_rest = seat_rest(t, s) - now > 2 * CLAUDE_REST
+            if not (s != '3' and long_rest and claude_dir(s)):
+                continue
+            fresh = claude_usage_api(int(s))
+            if not fresh or claude_full_until(fresh, now):
                 continue
             log(f'seat {s} ({SEAT_NAMES[s]}) has room again before its rest ended, back in')
-            rest.pop(s, None)
+            (t.get('rest') or {}).pop(s, None)
+            SEAT_REST.pop(s, None)
         if s == '3':
             if limits_ok():
                 return s
@@ -446,7 +465,7 @@ def pick_seat(t, now, limits_ok):
             continue
         until = claude_full_until((claude_usage_cached().get('accounts') or {}).get(s), now)
         if until:
-            rest[s] = until + AFTER_RESET
+            set_rest(t, s, until + AFTER_RESET)
             continue
         return s
     return None
@@ -460,8 +479,15 @@ def rest_seat(t, s, outcome, now):
         until = now + LIMITS_EVERY  # exec says "limit" before the app-server does (02.11), so trust exec, then ask fresh
     else:
         reset = claude_full_until(claude_usage_api(int(s)), now)
-        until = reset + AFTER_RESET if reset else now + CLAUDE_REST
-    t.setdefault('rest', {})[s] = until
+        if reset:
+            until = reset + AFTER_RESET
+        else:
+            # no reset time known: 15 min, then 30, 60... up to 4 h (19.11 00:09: a new dead run every 15 min all night)
+            prev = SEAT_STRIKES.get(s) or {}
+            n = prev.get('n', 0) + 1 if now - prev.get('at', 0) < 6 * 3600 else 1
+            SEAT_STRIKES[s] = {'n': n, 'at': now}
+            until = now + min(CLAUDE_REST * 2 ** (n - 1), 16 * CLAUDE_REST)
+    set_rest(t, s, until)
     log(f'seat {s} ({SEAT_NAMES[s]}) rests till {datetime.fromtimestamp(until):%d.%m %H:%M} ({outcome})')
 
 
@@ -1023,6 +1049,8 @@ def tick_items(key, t, now, limits_ok):
             save_handover(key, t, now)  # it got some way into the item: the next seat picks up from there
         if outcome in ('limited', 'broken'):
             rest_seat(t, t.get('seat') or '3', outcome, now)  # and straight on to the next seat below
+        else:
+            SEAT_STRIKES.pop(t.get('seat') or '3', None)
     if t.get('waiting') or t.get('paused'):   # paused: the finished run is booked, no new one
         return
     if open_items(t['plan']) == 0:
@@ -1134,6 +1162,11 @@ def tick(caf, limits_box):
     now = time.time()
     with watch_list() as data:
         threads = data['threads']
+        global SEAT_REST, SEAT_STRIKES
+        SEAT_REST = data.setdefault('seat_rest', {})
+        SEAT_STRIKES = data.setdefault('seat_strikes', {})
+        for s in [s for s, u in SEAT_REST.items() if u <= now]:
+            SEAT_REST.pop(s)
         live = {k: v for k, v in threads.items() if not v.get('paused') and not v.get('done')}
         # paused while a run still goes: keep the mac awake for it and still catch its end (17.11 02:02, 18.11 07:25)
         paused_runs = {k: v for k, v in threads.items() if v.get('paused') and not v.get('done')
