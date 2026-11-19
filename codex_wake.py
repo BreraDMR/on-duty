@@ -1112,6 +1112,11 @@ SKILL_FILE = next((d / 'SKILL.md' for d in (BASE / 'skill', BASE / 'skill-exampl
 
 def ask_damir(key, t, outcome):
     """The run's question goes to Damir's "Дежурный: вопросы" chat in the Codex app; he answers there."""
+    # the item may have been settled while the run went (06.11 16:42 he'd said yes a minute before, 18.11 11:40
+    # the demo was already out): no [?] left in the plan and nothing waiting = the question is stale, log only
+    if outcome == 'question' and open_items(t['plan'], '?') == 0:
+        log(f'{key} question not sent: no [?] item left in the plan, settled already')
+        return
     try:
         question = Path(t['run_last']).read_text().replace(ITEM_QUESTION, '').replace(NEED_DAMIR, '').strip()
     except (OSError, KeyError):
