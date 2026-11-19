@@ -41,6 +41,7 @@ LIMITS_EVERY = 600      # how often to ask for limits while a thread waits, unle
 AFTER_RESET = 90        # grace after resetsAt before we poke anything
 WAKE_CONFIRM = 300      # no new turn this long after a wake = it didn't take
 WAIT_NOTICE = 180       # idle this long without "plan closed" = waiting for Damir
+DONE_AFTER = 86400      # keep a closed plan in the main list for one day
 
 MODE_RULES = {
     'review': 'Режим ревью: проходи план, ищи проблемы, исправляй, коммить мелко.',
@@ -97,6 +98,47 @@ def read_watch():
         return json.loads(WATCH.read_text())
     except (OSError, ValueError):
         return {'threads': {}}
+
+
+def mark_done(t, now):
+    t.update(done=True, last_state='done', done_at=now)
+
+
+def done_at(t, now):
+    return t.get('done_at') or t.get('state_at') or now
+
+
+def archived(t, now):
+    return bool(t.get('done') and now - done_at(t, now) > DONE_AFTER)
+
+
+def register_duty(data, key, fields):
+    """A plan keeps its entry (and any live run), even when added from another chat."""
+    plan = fields.get('plan')
+    if plan:
+        plan = fields['plan'] = str(Path(plan).expanduser().resolve())
+        matches = [k for k, t in data['threads'].items() if t.get('plan')
+                   and str(Path(t['plan']).expanduser().resolve()) == plan]
+        if matches:
+            key = matches[0]
+        elif fields.get('kind') == 'items' and key in data['threads'] and data['threads'][key].get('plan'):
+            # Two folders can have a plan with the same filename.
+            key += '-' + hashlib.sha256(plan.encode()).hexdigest()[:10]
+    old = data['threads'].get(key, {})
+    t = {**old, **fields, 'name': fields.get('name') or old.get('name') or Path(plan or key).stem,
+         'cwd': fields.get('cwd') or old.get('cwd') or str(Path(plan).parent if plan else HOME),
+         'added_at': old.get('added_at') or time.time(), 'paused': False, 'done': False,
+         'waiting': False, 'failures': 0, 'no_progress': 0}
+    if old.get('kind'):
+        t['kind'] = old['kind']
+    elif old:
+        t.pop('kind', None)
+    if old and old.get('kind') != fields.get('kind'):
+        t['cwd'] = old.get('cwd') or t['cwd']
+    t.pop('done_at', None)
+    t['last_state'] = 'running' if pid_alive(t.get('run_pid')) else 'idle'
+    data['threads'][key] = t
+    return key
 
 
 # ---------- codex side ----------
@@ -900,6 +942,7 @@ def answer_plan(key, text, expected=None):
                 sys.exit(f'Коммит не получился, план изменился во время записи. Проверь {plan}; дежурство не продолжено.\n{e.stderr}')
         # Same reset as resume, after the answer has been saved (and committed when under git).
         t.update(paused=False, done=False, waiting=False, failures=0, no_progress=0)
+        t.pop('done_at', None)
         t['last_state'] = 'running' if pid_alive(t.get('run_pid')) else 'idle'
         t.pop('handover', None)
     log(f'answer {key}: plan {plan}, commit {commit or "not under git"}; resumed')
@@ -1195,7 +1238,7 @@ def tick_items(key, t, now, limits_ok):
         if outcome != 'network':
             t['failures'] = t.get('failures', 0) + 1 if outcome in ('failed', 'timeout') else 0
         if outcome == 'closed':
-            t['done'], t['last_state'] = True, 'done'
+            mark_done(t, now)
             notify('Дежурный: план закрыт', name)
             return
         if outcome in ('question', 'damir'):
@@ -1220,7 +1263,7 @@ def tick_items(key, t, now, limits_ok):
         if open_items(t['plan'], '?'):
             t['waiting'], t['last_state'] = True, 'waiting'  # only parked items left: nothing to do until he answers
             return
-        t['done'], t['last_state'] = True, 'done'
+        mark_done(t, now)
         notify('Дежурный: план закрыт', name)
         return
     seat = pick_seat(t, now, limits_ok)
@@ -1330,6 +1373,9 @@ def tick(caf, limits_box):
     now = time.time()
     with watch_list() as data:
         threads = data['threads']
+        for t in threads.values():
+            if t.get('done'):
+                t.setdefault('done_at', done_at(t, now))
         global SEAT_REST, SEAT_STRIKES
         SEAT_REST = data.setdefault('seat_rest', {})
         SEAT_STRIKES = data.setdefault('seat_strikes', {})
@@ -1382,7 +1428,7 @@ def tick(caf, limits_box):
             if st['state'] != prev:
                 log(f'{tid} {prev} -> {st["state"]}')
             if st['state'] == 'done':
-                t['done'] = True
+                mark_done(t, now)
                 notify('Дежурный: план закрыт', name)
                 log(f'{tid} plan closed, off duty')
             elif st['state'] == 'limited':
@@ -1541,13 +1587,9 @@ def main():
         plan = str(Path(args.plan).expanduser().resolve())
         if open_items(plan) is None:
             sys.exit(f'план {plan} не читается')
-        key = 'items-' + Path(plan).stem
         with watch_list() as data:
-            old = data['threads'].get(key, {})
-            data['threads'][key] = {**old, 'kind': 'items', 'name': args.name or old.get('name') or Path(plan).stem,
-                                    'mode': args.mode, 'plan': plan, 'cwd': args.cwd or old.get('cwd') or str(Path(plan).parent),
-                                    'added_at': old.get('added_at') or time.time(), 'paused': False, 'done': False,
-                                    'waiting': False, 'failures': 0, 'no_progress': 0}
+            key = register_duty(data, 'items-' + Path(plan).stem,
+                                {'kind': 'items', 'name': args.name, 'mode': args.mode, 'plan': plan, 'cwd': args.cwd})
         log(f'{key} on duty item by item, mode {args.mode}, plan {plan}')
         print(f'{key} на дежурстве по пунктам: режим {args.mode}, план {plan}, открытых пунктов {open_items(plan)}.')
         return
@@ -1559,12 +1601,11 @@ def main():
         meta = thread_meta(args.thread)
         with watch_list() as data:
             old = data['threads'].get(args.thread, {})
-            data['threads'][args.thread] = {**old, 'name': args.name or old.get('name') or Path(meta.get('cwd') or '').name,
-                                            'mode': args.mode, 'plan': args.plan or old.get('plan'),
-                                            'cwd': meta.get('cwd'), 'added_at': old.get('added_at') or time.time(),
-                                            'paused': False, 'done': False}
-        log(f'{args.thread} on duty, mode {args.mode}, plan {args.plan}')
-        print(f'Поток {args.thread} на дежурстве: режим {args.mode}, план {args.plan or "—"}.')
+            key = register_duty(data, args.thread,
+                                {'name': args.name or (None if args.plan or old.get('plan') else Path(meta.get('cwd') or '').name),
+                                 'mode': args.mode, 'plan': args.plan or old.get('plan'), 'cwd': meta.get('cwd')})
+        log(f'{key} on duty, mode {args.mode}, plan {args.plan}')
+        print(f'Поток {key} на дежурстве: режим {args.mode}, план {args.plan or "—"}.')
         return
     if args.cmd in ('remove', 'pause', 'resume'):
         with watch_list() as data:
@@ -1583,6 +1624,8 @@ def main():
                             log(f'resume {k} refused: no answer in the plan yet')
                             continue
                         t.update(done=False, waiting=False, failures=0, no_progress=0)
+                        t.pop('done_at', None)
+                        t['last_state'] = 'running' if pid_alive(t.get('run_pid')) else 'idle'
         log(f'{args.cmd} {", ".join(keys)}')
         print(f'{args.cmd}: {", ".join(keys)}')
         return
@@ -1631,11 +1674,16 @@ def main():
         lim = json.loads(LIMITS_CACHE.read_text())
     except (OSError, ValueError):
         lim = None
-    rows = []
+    rows, completed = [], []
+    now = time.time()
     for tid, t in data['threads'].items():
+        if archived(t, now):
+            completed.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'),
+                              'state': 'done', 'state_at': done_at(t, now), 'wakes': t.get('runs', t.get('wakes', 0))})
+            continue
         if t.get('kind') == 'items':
             # the menu bar knows running/limited/idle/done/paused; a question for Damir is its "idle" (= waits for you)
-            state = ('paused' if t.get('paused') else 'done' if t.get('done') else 'idle' if t.get('waiting')
+            state = ('done' if t.get('done') else 'paused' if t.get('paused') else 'idle' if t.get('waiting')
                      else {'stuck': 'paused'}.get(t.get('last_state'), t.get('last_state') or 'idle'))
             question = plan_question(t['plan'])
             rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'), 'state': state,
@@ -1648,12 +1696,13 @@ def main():
                                      f'последний: {t.get("last_outcome") or "—"}, журнал {t.get("run_log") or "—"}'})
             continue
         st = thread_state(tid)
-        state = 'paused' if t.get('paused') else 'done' if t.get('done') else st['state']
+        state = 'done' if t.get('done') else 'paused' if t.get('paused') else st['state']
         rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'),
                      'state': state, 'state_at': st.get('at'), 'wakes': t.get('wakes', 0),
                      'loaded': loaded_in_app(tid), 'last_msg': (st.get('msg') or '')[-200:]})
     if getattr(args, 'json', False):
-        print(json.dumps({'threads': rows, 'limits': lim, 'claude': claude_accounts(), 'mac': mac_status(),
+        print(json.dumps({'threads': rows, 'completed': sorted(completed, key=lambda t: t['state_at'], reverse=True),
+                          'limits': lim, 'claude': claude_accounts(), 'mac': mac_status(),
                           'carousel': carousel_status(), 'tokens': tokens_cached(),
                           'daemon': bool(subprocess.run(['pgrep', '-f', 'codex_wake.py daemon'], capture_output=True).stdout)},
                          ensure_ascii=False, indent=2))
@@ -1666,6 +1715,8 @@ def main():
               + (f'  · {r["seat"]}' if r.get('seat') else ''))
     if not rows:
         print('На дежурстве никого.')
+    if completed:
+        print(f'готово: {len(completed)}')
 
 
 if __name__ == '__main__':
