@@ -12,11 +12,13 @@ let script = Bundle.main.object(forInfoDictionaryKey: "DutyScript") as? String
 
 struct Window: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 struct Limits: Decodable { let allowed: Bool; let primary: Window?; let secondary: Window?; let free_resets: Int?; let checked_at: Double? }
+struct DutyQuestion: Decodable { let text: String; let token: String; let item: String? }
 struct Thread: Decodable, Identifiable {
     let id: String; let name: String?; let mode: String?; let plan: String?
     let state: String; let state_at: Double?; let wakes: Int; let last_msg: String?
     let open_thread: String?; let pending: Int?  // item-by-item duty: the questions chat, items parked for Damir
     let seat: String?                            // item-by-item duty: where the last run went (Codex / Claude 1 / Claude 2)
+    let question: DutyQuestion?
 }
 struct ClaudeWindow: Decodable { let usedPercent: Double?; let resetsAt: Double?; let resetPassed: Bool? }
 struct ClaudeAccount: Decodable, Identifiable {
@@ -99,6 +101,11 @@ final class Model: ObservableObject {
     @Published var carouselMsg = ""
     @Published var sid = ""            // no @State: the Command Line Tools swiftc has no SwiftUI macro plugin
     @Published var macMode = "normal"
+    @Published var answerThread = ""
+    @Published var answerToken = ""
+    @Published var answerDraft = ""
+    @Published var answerMessage = ""
+    @Published var answering = false
     private var timer: Timer?
     private var lastAsks: Int?
 
@@ -148,6 +155,21 @@ final class Model: ObservableObject {
             let out = run(args)
             DispatchQueue.main.async { then?(out) }
             self.refresh()
+        }
+    }
+
+    func editAnswer(_ t: Thread, _ q: DutyQuestion) {
+        answerThread = t.id; answerToken = q.token; answerDraft = ""; answerMessage = ""
+    }
+
+    func sendAnswer(_ t: Thread) {
+        let text = answerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !answering else { return }
+        answering = true; answerMessage = "записываю ответ…"
+        cmd(["answer", t.id, text, "--question", answerToken]) { out in
+            self.answering = false
+            self.answerMessage = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if out.hasPrefix("Ответ записан,") { self.answerThread = ""; self.answerDraft = "" }
         }
     }
 
@@ -370,20 +392,45 @@ struct PanelView: View {
         Block(title: "Дежурства") {
             if let threads = m.status?.threads, !threads.isEmpty {
                 ForEach(threads) { t in
-                    HStack(spacing: 6) {
-                        let (ic, col) = stateIcon(t.state)
-                        Image(systemName: ic).foregroundStyle(col)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(t.name ?? String(t.id.prefix(8))).font(.callout)
-                            Text(stateText(t) + ((t.pending ?? 0) > 0 ? " · ❓ \(t.pending!)" : ""))
-                                .font(.caption2).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            let (ic, col) = stateIcon(t.state)
+                            Image(systemName: ic).foregroundStyle(col)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(t.name ?? String(t.id.prefix(8))).font(.callout)
+                                Text(stateText(t) + ((t.pending ?? 0) > 0 ? " · ❓ \(t.pending!)" : ""))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            threadMenu(t)
                         }
-                        Spacer()
-                        threadMenu(t)
+                        if let q = t.question {
+                            Text(q.text).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            if m.answerThread == t.id {
+                                TextField("Решение Дамира", text: $m.answerDraft, axis: .vertical)
+                                    .textFieldStyle(.roundedBorder).font(.caption).lineLimit(2...6)
+                                    .disabled(m.answering)
+                                HStack {
+                                    Button("Записать и продолжить") { m.sendAnswer(t) }
+                                        .disabled(m.answering || m.answerToken != q.token || m.answerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                    Button("Отмена") { m.answerThread = ""; m.answerDraft = "" }
+                                        .disabled(m.answering)
+                                }
+                                if m.answerToken != q.token {
+                                    Text("Вопрос изменился. Нажми «Ответить» ещё раз.").font(.caption2).foregroundStyle(.orange)
+                                    Button("Ответить") { m.editAnswer(t, q) }.disabled(m.answering)
+                                }
+                            } else {
+                                Button("Ответить") { m.editAnswer(t, q) }.disabled(m.answering)
+                            }
+                        }
                     }
                 }
             } else {
                 Text("никого — в чате Codex: «на дежурство, план — …»").font(.caption).foregroundStyle(.secondary)
+            }
+            if !m.answerMessage.isEmpty {
+                Text(m.answerMessage).font(.caption2).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
