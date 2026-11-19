@@ -9,7 +9,7 @@ by itself (checked 02.11.2026); a thread that isn't open in the app gets opened 
     codex_wake.py add <thread> [--mode review|recommended] [--plan PATH] [--name NAME]
     codex_wake.py add-items --plan PATH [--mode ...] [--name NAME] [--cwd DIR]
                                              a fresh run per plan item, no long thread (since 02.11.2026); the run goes
-                                             to whichever seat has room: Codex, Claude 1, Claude 2 (since 06.11.2026)
+                                             to whichever seat has room: Codex, Claude, Claude1 (since 06.11.2026)
     codex_wake.py seat 1|2|3 on|off          let item runs (and the session carousel) use that seat or not
     codex_wake.py remove|pause|resume <thread|all>
     codex_wake.py list | status [--json] | limits
@@ -428,7 +428,7 @@ def carousel_stop(sid):
 # ---------- seats: who runs the next plan item ----------
 # Same switches as the session carousel (its off-* files), so one row of toggles in the window rules both.
 SEATS = ('3', '1', '2')  # Codex first so Claude stays free for live sessions, then the personal account, then the work one
-SEAT_NAMES = {'1': 'Claude 1', '2': 'Claude 2', '3': 'Codex'}
+SEAT_NAMES = {'1': 'Claude', '2': 'Claude1', '3': 'Codex'}  # same as the CLI aliases: claude / claude1 (Damir 19.11)
 SEAT_OFF = {'1': 'off-account1', '2': 'off-account2', '3': 'off-codex'}
 CLAUDE_BIN = HOME / '.local/bin/claude'
 SEAT_TOKENS = HOME / '.config/claude-oauth'   # seatN-*.token from claude setup-token, chmod 600, not in git
@@ -757,19 +757,49 @@ def claude_usage_api(n):
                              capture_output=True, text=True, timeout=5).stdout
         oauth = json.loads(raw)['claudeAiOauth']
         if (oauth.get('expiresAt') or 0) / 1000 < time.time():
-            return None
+            return claude_usage_probe(n)
         req = urllib.request.Request('https://api.anthropic.com/api/oauth/usage', headers={
             'Authorization': f'Bearer {oauth["accessToken"]}', 'anthropic-beta': 'oauth-2025-04-20'})
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read())
     except Exception:
-        return None
+        return claude_usage_probe(n)
     out = {}
     for key in ('five_hour', 'seven_day'):
         w = d.get(key)
         if w and w.get('utilization') is not None:
             reset = datetime.fromisoformat(w['resets_at']).timestamp() if w.get('resets_at') else None
             out[key] = {'used_percentage': w['utilization'], 'resets_at': reset}
+    return out or None
+
+
+def claude_usage_probe(n):
+    """Fallback when the account's normal login has expired (nobody opened that account for ~8 h, 19.11 Claude 1
+    showed 0 % while the week was at 16 %). The long-lived setup-token can't read /usage (needs user:profile scope),
+    but any API answer carries the same numbers in its headers, so ask Haiku for one token: ~23 tokens a go."""
+    import urllib.request, urllib.error
+    tok = next(SEAT_TOKENS.glob(f'seat{n}-*.token'), None)
+    if not tok:
+        return None
+    body = json.dumps({'model': 'claude-haiku-4-5', 'max_tokens': 1,
+                       'system': "You are Claude Code, Anthropic's official CLI for Claude.",
+                       'messages': [{'role': 'user', 'content': '.'}]}).encode()
+    req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, headers={
+        'Authorization': f'Bearer {tok.read_text().strip()}', 'anthropic-beta': 'oauth-2025-04-20',
+        'anthropic-version': '2023-06-01', 'content-type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            h = r.headers
+    except urllib.error.HTTPError as e:
+        h = e.headers   # a 429 on a full window still has the numbers
+    except Exception:
+        return None
+    out = {}
+    for key, tag in (('five_hour', '5h'), ('seven_day', '7d')):
+        u = h.get(f'anthropic-ratelimit-unified-{tag}-utilization')
+        if u is not None:
+            reset = h.get(f'anthropic-ratelimit-unified-{tag}-reset')
+            out[key] = {'used_percentage': min(round(float(u) * 100, 1), 100), 'resets_at': float(reset) if reset else None}
     return out or None
 
 
@@ -1611,7 +1641,7 @@ def main():
     cs = sub.add_parser('carousel-start', help='carousel of accounts for the claude session with this id (from /status)')
     cs.add_argument('sid')
     cx = sub.add_parser('carousel-stop'); cx.add_argument('sid')
-    se = sub.add_parser('seat', help='1 = Claude 1, 2 = Claude 2, 3 = Codex: may item runs and the carousel use it')
+    se = sub.add_parser('seat', help='1 = Claude, 2 = Claude1, 3 = Codex: may item runs and the carousel use it')
     se.add_argument('n', choices=SEATS); se.add_argument('state', choices=('on', 'off'))
     args = ap.parse_args()
 
