@@ -480,11 +480,67 @@ def set_rest(t, s, until):
     SEAT_REST[s] = until
 
 
+def wait_until(until, now):
+    fmt = '%H:%M' if datetime.fromtimestamp(until).date() == datetime.fromtimestamp(now).date() else '%d.%m %H:%M'
+    return datetime.fromtimestamp(until).strftime(fmt)
+
+
+def codex_wait_reason(now, lim=None):
+    if lim is None:
+        try:
+            lim = json.loads(LIMITS_CACHE.read_text())
+        except (OSError, ValueError):
+            return 'нет данных о лимите'
+    if now - lim.get('checked_at', 0) > LIMITS_STALE_OK:
+        return 'нет свежих данных о лимите'
+    resets = [w['resetsAt'] + AFTER_RESET for w in (lim.get('primary'), lim.get('secondary'))
+              if w and (w.get('usedPercent') or 0) >= CODEX_START_MAX and (w.get('resetsAt') or 0) > now]
+    if resets:
+        return 'до ' + wait_until(max(resets), now)
+    return 'запуск пока недоступен' if not lim.get('allowed') else 'ждёт проверки лимита'
+
+
+def duty_reason(t, now, lim=None):
+    """Explain the last scheduling decision without asking the APIs again."""
+    running = t.get('last_state') == 'running'
+    if t.get('done'):
+        return 'план закрыт'
+    if t.get('paused'):
+        if running:
+            return 'на паузе; текущий запуск ещё идёт'
+        return 'остановлен после повторных ошибок или отсутствия прогресса' if t.get('last_state') == 'stuck' else 'на паузе'
+    if t.get('waiting'):
+        return 'ждёт ответа Дамира'
+    if running:
+        seat = SEAT_NAMES.get(t.get('seat') or '3')
+        started = t.get('run_started') if t.get('kind') == 'items' else t.get('state_at')
+        return f'идёт на {seat}' + (f' с {wait_until(started, now)}' if started else '')
+    if t.get('last_state') == 'held':
+        return t.get('wait_reason') or f'приоритет {t.get("priority", 2)}, ждёт добавления в окно'
+    if t.get('last_state') == 'limited':
+        if t.get('kind') == 'items':
+            return 'ждёт место: ' + '; '.join(t.get('seat_wait') or ['причина появится после выбора места'])
+        if (t.get('last_wake_at') or 0) > (t.get('state_at') or 0):
+            return 'пробуждение отправлено; ждёт продолжения в Codex'
+        return 'ждёт Codex: ' + codex_wait_reason(now, lim)
+    if t.get('last_state') == 'missing':
+        return 'не найден журнал потока Codex'
+    if t.get('wake_failed_at'):
+        return 'поток не продолжился после пробуждения; открой его в Codex'
+    if t.get('kind') != 'items' and t.get('last_state') == 'idle':
+        return 'ждёт ответа Дамира' if t.get('wait_notified') else 'ждёт продолжения в Codex'
+    return 'ждёт следующего тика сторожа'
+
+
 def pick_seat(t, now, limits_ok):
     """First seat that is switched on, not resting after a limit and has room. Rests go to the plan and to the shared list."""
+    t['seat_wait'] = []
+    def blocked(s, why):
+        t['seat_wait'].append(f'{SEAT_NAMES[s]} {why}')
     # a duty can ask for its own seat order (Damir 17.11: his relay goes to Claude 2 first, the rest only when it's full)
     for s in (t.get('seat_order') or SEATS):
         if not seat_on(s):
+            blocked(s, 'выключен')
             continue
         if seat_rest(t, s) > now:
             # a long Claude rest comes from a "full" window; the window can reset early (17.11: weekly limit of
@@ -494,9 +550,11 @@ def pick_seat(t, now, limits_ok):
             # Short rests (a run just said "limit" without a reset time) are kept, otherwise we'd loop on it.
             long_rest = seat_rest(t, s) - now > 2 * CLAUDE_REST
             if not (s != '3' and long_rest and claude_dir(s)):
+                blocked(s, 'до ' + wait_until(seat_rest(t, s), now))
                 continue
             fresh = claude_usage_api(int(s))
             if not fresh or claude_full_until(fresh, now):
+                blocked(s, 'до ' + wait_until(seat_rest(t, s), now))
                 continue
             log(f'seat {s} ({SEAT_NAMES[s]}) has room again before its rest ended, back in')
             (t.get('rest') or {}).pop(s, None)
@@ -504,12 +562,15 @@ def pick_seat(t, now, limits_ok):
         if s == '3':
             if limits_ok():
                 return s
+            blocked(s, codex_wait_reason(now))
             continue
         if not claude_dir(s):
+            blocked(s, 'не настроен')
             continue
         until = claude_full_until((claude_usage_cached().get('accounts') or {}).get(s), now)
         if until:
             set_rest(t, s, until + AFTER_RESET)
+            blocked(s, 'до ' + wait_until(until + AFTER_RESET, now))
             continue
         return s
     return None
@@ -1169,24 +1230,27 @@ def seat_window(seat):
     return w.get('used_percentage'), w.get('resets_at'), 300 * 60
 
 
-def want_filler(key, seat, now):
-    """May a lower-priority plan start a run on this seat right now?"""
+def filler_wait_reason(key, t, seat, now):
+    """Empty means it may start; otherwise say why the lower priority plan waits."""
+    prefix = f'приоритет {t.get("priority", 2)}, '
     top_here = any(pid_alive(x.get('run_pid')) and x.get('seat') == seat
                    for x in THREADS_NOW.values() if x.get('priority', 2) <= 1)
     if not top_here:
-        return True   # nothing important on this seat, the window would just idle
+        return ''   # nothing important on this seat, the window would just idle
     used, reset, length = seat_window(seat)
     if used is None or not reset or reset <= now:
-        return True
+        return ''
     elapsed = now - (reset - length)
     if elapsed < PACE_MIN_ELAPSED:
-        return False
+        return prefix + f'ждёт оценки темпа {SEAT_NAMES[seat]} до {wait_until(reset - length + PACE_MIN_ELAPSED, now)}'
     projected = used + used / max(elapsed, 1) * (reset - now)
-    if projected >= 100 or now - FILL_LAST.get(seat, 0) < FILL_GAP:
-        return False
+    if projected >= 100:
+        return prefix + f'окно {SEAT_NAMES[seat]} и так выберется'
+    if now - FILL_LAST.get(seat, 0) < FILL_GAP:
+        return prefix + f'следующее добавление на {SEAT_NAMES[seat]} после {wait_until(FILL_LAST[seat] + FILL_GAP, now)}'
     FILL_LAST[seat] = now
     log(f'{key}: seat {seat} at {used:.0f} %, pace says {projected:.0f} % by reset, adding a filler')
-    return True
+    return ''
 
 
 def reap_group(key, pid):
@@ -1228,7 +1292,7 @@ def tick_items(key, t, now, limits_ok):
         size = plan_size(t['plan'])
         if not progressed and outcome == 'item' and size and t.get('plan_size_before') and size > t['plan_size_before'] + 40:
             progressed = True
-        t.update(run_pid=None, last_outcome=outcome, state_at=now)
+        t.update(run_pid=None, last_state='idle', last_outcome=outcome, state_at=now)
         t.pop('run_killed', None)
         if outcome in ('item', 'question', 'damir', 'closed'):
             t.pop('handover', None)  # the item moved on, nothing left to hand over
@@ -1267,9 +1331,11 @@ def tick_items(key, t, now, limits_ok):
         notify('Дежурный: план закрыт', name)
         return
     seat = pick_seat(t, now, limits_ok)
-    if seat and t.get('priority', 2) > 1 and not want_filler(key, seat, now):
-        t['last_state'] = 'held'   # waits for room in the window, the top plans go first
-        return
+    if seat and t.get('priority', 2) > 1:
+        t['wait_reason'] = filler_wait_reason(key, t, seat, now)
+        if t['wait_reason']:
+            t['last_state'] = 'held'   # waits for room in the window, the top plans go first
+            return
     if not seat:
         if t.get('last_state') != 'limited':
             notify('Дежурный: лимит', f'{name} — все включённые места в лимите, жду сброса')
@@ -1369,9 +1435,17 @@ def should_hold(live):
     return want
 
 
+@contextmanager
+def scheduling_watch(now, limits_box):
+    with watch_list() as data:
+        yield data
+        for t in data['threads'].values():
+            t['reason'] = duty_reason(t, now, limits_box.get('v'))
+
+
 def tick(caf, limits_box):
     now = time.time()
-    with watch_list() as data:
+    with scheduling_watch(now, limits_box) as data:
         threads = data['threads']
         for t in threads.values():
             if t.get('done'):
@@ -1679,7 +1753,8 @@ def main():
     for tid, t in data['threads'].items():
         if archived(t, now):
             completed.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'),
-                              'state': 'done', 'state_at': done_at(t, now), 'wakes': t.get('runs', t.get('wakes', 0))})
+                              'state': 'done', 'reason': duty_reason(t, now, lim),
+                              'state_at': done_at(t, now), 'wakes': t.get('runs', t.get('wakes', 0))})
             continue
         if t.get('kind') == 'items':
             # the menu bar knows running/limited/idle/done/paused; a question for Damir is its "idle" (= waits for you)
@@ -1687,6 +1762,7 @@ def main():
                      else {'stuck': 'paused'}.get(t.get('last_state'), t.get('last_state') or 'idle'))
             question = plan_question(t['plan'])
             rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'), 'state': state,
+                         'reason': duty_reason(t, now, lim),
                          'seat': SEAT_NAMES.get(t.get('seat') or '3'),
                          'state_at': t.get('state_at') or t.get('run_started'), 'wakes': t.get('runs', 0), 'loaded': False,
                          'open_thread': t.get('question_thread') or data.get('questions_thread'), 'pending': open_items(t['plan'], '?') or 0,
@@ -1699,6 +1775,7 @@ def main():
         state = 'done' if t.get('done') else 'paused' if t.get('paused') else st['state']
         rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'),
                      'state': state, 'state_at': st.get('at'), 'wakes': t.get('wakes', 0),
+                     'reason': duty_reason({**t, 'last_state': st['state'], 'state_at': st.get('at')}, now, lim),
                      'loaded': loaded_in_app(tid), 'last_msg': (st.get('msg') or '')[-200:]})
     if getattr(args, 'json', False):
         print(json.dumps({'threads': rows, 'completed': sorted(completed, key=lambda t: t['state_at'], reverse=True),
@@ -1713,6 +1790,7 @@ def main():
     for r in rows:
         print(f'{r["state"]:8} {r["name"]:30} {r["mode"]:11} будил {r["wakes"]}×  {r["id"]}'
               + (f'  · {r["seat"]}' if r.get('seat') else ''))
+        print(f'  Почему: {r["reason"]}')
     if not rows:
         print('На дежурстве никого.')
     if completed:
