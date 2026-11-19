@@ -1,11 +1,14 @@
 #!/bin/zsh
 # Builds Дежурный.app into /Applications. Needs only the Command Line Tools (swiftc).
 set -e
-cd "${0:A:h}"
+# resolve before cd: with a relative $0 (zsh menubar/build.sh) :A after cd pointed into menubar/menubar
+HERE="${0:A:h}"
+SCRIPT="${HERE:h}/codex_wake.py"
+[[ -f "$SCRIPT" ]] || { echo "no $SCRIPT" >&2; exit 1; }
+cd "$HERE"
 B=$(mktemp -d "${TMPDIR:-/tmp}/dezhurny-build.XXXXXX")
 trap 'rm -rf "$B"' EXIT
 APP="$B/Дежурный.app"
-SCRIPT="${0:A:h:h}/codex_wake.py"
 PY="$(command -v python3)"
 mkdir -p "$APP/Contents/MacOS"
 swiftc -O -target "$(uname -m)-apple-macosx14.0" -swift-version 5 -parse-as-library -o "$APP/Contents/MacOS/Dezhurny" Dezhurny.swift
