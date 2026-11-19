@@ -17,7 +17,7 @@ struct Thread: Decodable, Identifiable {
     let id: String; let name: String?; let mode: String?; let plan: String?
     let state: String; let state_at: Double?; let wakes: Int; let last_msg: String?
     let open_thread: String?; let pending: Int?  // item-by-item duty: the questions chat, items parked for Damir
-    let seat: String?                            // item-by-item duty: where the last run went (Codex / Claude 1 / Claude 2)
+    let seat: String?                            // item-by-item duty: where the last run went (Codex / Claude / Claude1)
     let question: DutyQuestion?
     let reason: String?
 }
@@ -42,6 +42,9 @@ struct Status: Decodable {
 }
 
 // 14 600 000 -> "14,6 млн", 1 260 000 000 -> "1,26 млрд"
+// same names as the CLI: `claude` is account 1, `claude1` is the second config dir (Damir 19.11)
+func seatName(_ n: Int) -> String { n == 1 ? "Claude" : "Claude\(n - 1)" }
+
 func tok(_ n: Double) -> String {
     let f = NumberFormatter(); f.locale = Locale(identifier: "ru_RU"); f.numberStyle = .decimal
     if n >= 1e9 { f.maximumFractionDigits = 2; return (f.string(from: NSNumber(value: n / 1e9)) ?? "") + " млрд" }
@@ -325,7 +328,7 @@ struct PanelView: View {
             ForEach(m.status?.claude ?? []) { a in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text("Claude \(a.account)").font(.callout.weight(.medium))
+                        Text(seatName(a.account)).font(.callout.weight(.medium))
                         Spacer()
                         if let age = ageText(a.updated_at) { Text(age).font(.caption2).foregroundStyle(.secondary) }
                     }
@@ -376,7 +379,7 @@ struct PanelView: View {
             if let c = m.status?.carousel {
                 HStack(spacing: 10) {
                     // each seat is its own switch: off = neither the duty nor the session carousel goes there
-                    ForEach([("1", "Claude 1"), ("2", "Claude 2"), ("3", "Codex")], id: \.0) { k, name in
+                    ForEach([("3", "Codex"), ("1", "Claude"), ("2", "Claude1")], id: \.0) { k, name in
                         let on = c.seats[k] == true
                         Button { m.cmd(["seat", k, on ? "off" : "on"]) } label: {
                             Label(name, systemImage: on ? "circle.fill" : "circle")
@@ -527,10 +530,10 @@ struct HelpView: View {
                 Button { m.showHelp = false } label: { Label("Назад", systemImage: "chevron.left") }.buttonStyle(.borderless)
             }
             item("Лимиты", "Полоски «5 ч» и «нед» у Codex и обоих аккаунтов Claude. Зелёный — до 70 %, жёлтый — до 90 %, красный — дальше. Справа — когда сброс. Токены на это не тратятся. «данные N назад» — цифры давно не обновлялись (у аккаунта протух вход — открой в нём сессию).")
-            item("Токены", "Под лимитами — сколько токенов ушло с последнего сброса, по журналам на этом маке. «Новых» — без повторного чтения кэша (это история переписки, которую модель перечитывает каждый шаг, её обычно ~98 %). Оба Claude считаются вместе — их журналы лежат в одной папке; окна — по Claude 1. Чат claude.ai сюда не попадает.")
+            item("Токены", "Под лимитами — сколько токенов ушло с последнего сброса, по журналам на этом маке. «Новых» — без повторного чтения кэша (это история переписки, которую модель перечитывает каждый шаг, её обычно ~98 %). Оба Claude считаются вместе — их журналы лежат в одной папке; окна — по Claude. Чат claude.ai сюда не попадает.")
             item("Мак", "Обычный — мак засыпает как всегда, дежурный его не держит. Пока дежурство — не даёт уснуть, пока кто-то на дежурстве. До 8:00 — не даёт уснуть до утра, потом сам вернётся в «Обычный». На батарее ниже 25 % мак отпускается в любом режиме. Экран гаснет как обычно. «Не дают уснуть» — кто сейчас держит мак.")
-            item("Карусель аккаунтов", "В нужной сессии Claude набери /status, скопируй ID сессии, вставь в поле и нажми «Запустить». Когда лимит аккаунта кончится, переписка сама переедет на другой Claude или в Codex. Кружки Claude 1 / Claude 2 / Codex — выключатели мест: нажми, чтобы выключить или включить. Выключенное место не берут ни карусель, ни дежурный. Пока карусель работает, мак не спит. «Стоп» у сессии — выключить.")
-            item("Дежурства", "Поставить: в чате Codex «на дежурство, план — <файл>». Дежурство по пунктам берёт для каждого пункта первое свободное включённое место: сначала Codex, потом Claude 1, потом Claude 2; кто сейчас работает — видно под названием. Вопросы дежурного приходят в чат «Дежурный: вопросы» в Codex, наверху окна тогда оранжевая плашка — нажми, откроется чат. «…» у дежурства — план, пауза, снять.")
+            item("Карусель аккаунтов", "В нужной сессии Claude набери /status, скопируй ID сессии, вставь в поле и нажми «Запустить». Когда лимит аккаунта кончится, переписка сама переедет на другой Claude или в Codex. Кружки Codex / Claude / Claude1 — выключатели мест: нажми, чтобы выключить или включить. Выключенное место не берут ни карусель, ни дежурный. Пока карусель работает, мак не спит. «Стоп» у сессии — выключить.")
+            item("Дежурства", "Поставить: в чате Codex «на дежурство, план — <файл>». Дежурство по пунктам берёт для каждого пункта первое свободное включённое место: сначала Codex, потом Claude, потом Claude1; кто сейчас работает — видно под названием. Вопросы дежурного приходят в чат «Дежурный: вопросы» в Codex, наверху окна тогда оранжевая плашка — нажми, откроется чат. «…» у дежурства — план, пауза, снять.")
             item("Кнопки внизу", "Обновить лимиты · журнал сторожа · проверить уведомление · пауза всем дежурствам · сторож вкл/выкл (выключенный никого не будит и мак не держит) · эта инструкция · закрыть значок (открыть снова — Cmd+Пробел → «Дежурный»).")
         }
     }
