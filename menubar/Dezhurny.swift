@@ -37,6 +37,7 @@ struct Tokens: Decodable { let codex: TokenWindows?; let claude: TokenWindows? }
 struct Status: Decodable {
     let threads: [Thread]; let limits: Limits?; let daemon: Bool; let claude: [ClaudeAccount]?
     let mac: Mac?; let carousel: Carousel?; let tokens: Tokens?
+    let completed: [Thread]?
 }
 
 // 14 600 000 -> "14,6 млн", 1 260 000 000 -> "1,26 млрд"
@@ -97,6 +98,7 @@ func ageText(_ t: Double) -> String? {
 func levelColor(_ p: Double) -> Color { p >= 90 ? .red : p >= 70 ? .yellow : .green }
 
 final class Model: ObservableObject {
+    @Published var completedExpanded = false
     @Published var status: Status?
     @Published var carouselMsg = ""
     @Published var sid = ""            // no @State: the Command Line Tools swiftc has no SwiftUI macro plugin
@@ -254,6 +256,27 @@ struct PanelView: View {
                     Divider()
                 }
                 duties
+                if let completed = m.status?.completed, !completed.isEmpty {
+                    DisclosureGroup("Готово: \(completed.count)", isExpanded: $m.completedExpanded) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(completed) { t in
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(t.name ?? String(t.id.prefix(8))).font(.callout)
+                                            if let at = t.state_at {
+                                                Text(Date(timeIntervalSince1970: at), style: .date)
+                                                    .font(.caption2).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        Spacer()
+                                        threadMenu(t)
+                                    }
+                                }
+                            }.padding(.top, 6)
+                        }.frame(maxHeight: 180)
+                    }.font(.caption)
+                }
                 Divider()
                 footer
             }
@@ -448,7 +471,7 @@ struct PanelView: View {
                 Button("Разбудить сейчас") { m.cmd(["wake", t.id, "--force"]) }.disabled(t.state == "running")
             }
             Divider()
-            if t.state == "paused" {
+            if t.state == "paused" || t.state == "done" {
                 Button("Продолжить дежурство") { m.cmd(["resume", t.id]) }
             } else {
                 Button("Пауза") { m.cmd(["pause", t.id]) }
