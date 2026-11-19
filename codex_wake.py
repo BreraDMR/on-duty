@@ -810,6 +810,7 @@ def handover_text(t):
             ' Проверку, которая в ходе записана зелёной на том же коммите и без правок после, не перезапускай. ')
 
 
+RUN_MAX = 3 * 3600      # a run longer than this is hung (16.11 a run sat 2 h 17 min on "API Error"; longest real one 110 min)
 HANDOVER_MIN_RUN = 180   # a run cut off sooner than this did nothing worth handing over (limit hit right at start)
 HANDOVER_TAIL = 120      # lines of the cut-off Codex log kept for the next run
 
@@ -939,6 +940,8 @@ def run_outcome(t):
     for mark, outcome in ((DONE_MARK, 'closed'), (ITEM_QUESTION, 'question'), (NEED_DAMIR, 'damir'), (ITEM_DONE, 'item')):
         if mark in end:
             return outcome
+    if t.get('run_killed'):
+        return 'timeout'
     import re
     if (t.get('seat') or '3') == '3':
         return 'limited' if 'usage limit' in tail or 'usage_limit' in tail else 'failed'
@@ -950,6 +953,9 @@ def run_outcome(t):
         return 'limited'
     if re.search(r'not logged in|please run /login|invalid api key|oauth token (has )?expired', short):
         return 'broken'
+    # 16.11 06:20: the whole answer was "API Error: Can't reach the API server (ENOTFOUND)" - the net, not the item
+    if re.search(r"api error: (can't reach|connection)|enotfound|econnrefused|etimedout|fetch failed", short):
+        return 'network'
     return 'failed'
 
 
@@ -1015,6 +1021,13 @@ def tick_items(key, t, now, limits_ok):
     name = t.get('name') or key
     if pid_alive(t.get('run_pid')):
         t['last_state'] = 'running'
+        if now - t.get('run_started', now) > RUN_MAX and not t.get('run_killed'):
+            t['run_killed'] = True
+            log(f'{key} run {t.get("runs")} goes {(now - t["run_started"]) / 60:.0f} min, longer than {RUN_MAX // 60}: stopping it')
+            try:
+                os.killpg(t['run_pid'], signal.SIGTERM)
+            except OSError as e:
+                log(f'{key}: could not stop run pid {t["run_pid"]}: {e}')
         return
     if t.get('run_pid'):  # a run just finished
         reap_group(key, t['run_pid'])
@@ -1026,11 +1039,14 @@ def tick_items(key, t, now, limits_ok):
         if not progressed and outcome == 'item' and size and t.get('plan_size_before') and size > t['plan_size_before'] + 40:
             progressed = True
         t.update(run_pid=None, last_outcome=outcome, state_at=now)
+        t.pop('run_killed', None)
         if outcome in ('item', 'question', 'damir', 'closed'):
             t.pop('handover', None)  # the item moved on, nothing left to hand over
         log(f'{key} run {t.get("runs")} ended: {outcome}, open items {t.get("open_before")} -> {opened}')
-        t['no_progress'] = 0 if progressed else t.get('no_progress', 0) + (outcome in ('item', 'failed', 'question'))
-        t['failures'] = t.get('failures', 0) + 1 if outcome == 'failed' else 0
+        t['no_progress'] = 0 if progressed else t.get('no_progress', 0) + (outcome in ('item', 'failed', 'question', 'timeout'))
+        # no net is nobody's fault: doesn't count as a failure, nor does it wipe the count
+        if outcome != 'network':
+            t['failures'] = t.get('failures', 0) + 1 if outcome in ('failed', 'timeout') else 0
         if outcome == 'closed':
             t['done'], t['last_state'] = True, 'done'
             notify('Дежурный: план закрыт', name)
@@ -1045,9 +1061,9 @@ def tick_items(key, t, now, limits_ok):
             log(f'{key} paused: failures {t["failures"]}, no progress {t["no_progress"]}')
             notify('Дежурный: застрял', f'{name} — поставил на паузу, глянь журнал')
             return
-        if outcome == 'limited' and now - t.get('run_started', now) > HANDOVER_MIN_RUN:
+        if outcome in ('limited', 'timeout', 'network') and now - t.get('run_started', now) > HANDOVER_MIN_RUN:
             save_handover(key, t, now)  # it got some way into the item: the next seat picks up from there
-        if outcome in ('limited', 'broken'):
+        if outcome in ('limited', 'broken', 'network'):  # network: the same backoff, so a dead net isn't a run per tick
             rest_seat(t, t.get('seat') or '3', outcome, now)  # and straight on to the next seat below
         else:
             SEAT_STRIKES.pop(t.get('seat') or '3', None)
