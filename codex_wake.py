@@ -901,8 +901,9 @@ def start_run(key, t, seat='3'):
         tok = next(SEAT_TOKENS.glob(f'seat{seat}-*.token'), None)
         if tok:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = tok.read_text().strip()
+        # json: the answer comes with its token count; unwrap_claude_json() puts the plain answer back in .last
         cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions',
-               '--disallowedTools', 'Agent,Workflow']
+               '--disallowedTools', 'Agent,Workflow', '--output-format', 'json']
         with open(out, 'w') as f, open(last, 'w') as fl:
             p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fl, stderr=f, start_new_session=True)
     t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(), seat=seat,
@@ -922,6 +923,25 @@ def plan_size(plan):
         return os.path.getsize(plan)
     except (OSError, TypeError):
         return None
+
+
+def unwrap_claude_json(key, t):
+    """claude -p --output-format json leaves one JSON object in .last: put the plain answer back there and log
+    what the run cost (124 Claude runs till 19.11 with no idea which items were the expensive ones)."""
+    if (t.get('seat') or '3') == '3' or not t.get('run_last'):
+        return
+    try:
+        r = json.loads(Path(t['run_last']).read_text())
+    except (OSError, ValueError):
+        return   # not json (killed half way, or an old-style run): leave it as it is
+    if not isinstance(r, dict) or 'result' not in r:
+        return
+    Path(t['run_last']).write_text(r.get('result') or '')
+    u = r.get('usage') or {}
+    fresh = sum(u.get(k) or 0 for k in ('input_tokens', 'output_tokens', 'cache_creation_input_tokens'))
+    cached = u.get('cache_read_input_tokens') or 0
+    t['run_tokens'] = {'fresh': fresh, 'cached': cached, 'turns': r.get('num_turns'), 'usd': r.get('total_cost_usd')}
+    log(f'{key} run {t.get("runs")} used {fresh} fresh + {cached} cached tokens in {r.get("num_turns")} turns')
 
 
 def run_outcome(t):
@@ -1033,6 +1053,7 @@ def tick_items(key, t, now, limits_ok):
         return
     if t.get('run_pid'):  # a run just finished
         reap_group(key, t['run_pid'])
+        unwrap_claude_json(key, t)
         outcome = run_outcome(t)
         opened = open_items(t['plan'])
         progressed = opened is not None and t.get('open_before') is not None and opened < t['open_before']
