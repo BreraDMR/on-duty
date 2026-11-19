@@ -35,6 +35,8 @@ QUEUE_DB = HOME / '.codex/queue_1.sqlite'
 DONE_MARK = 'ПЛАН ЗАКРЫТ'
 
 TICK = 60               # daemon loop, seconds
+CODEX_START_MAX = 90    # Codex window fuller than this %: don't start an item on it (19 runs cut off mid-item, 2.3M tokens)
+LIMITS_STALE_OK = 1800  # limits read failed (net hiccup): the last good answer this fresh still counts
 LIMITS_EVERY = 600      # how often to ask for limits while a thread waits, unless the reset is sooner
 AFTER_RESET = 90        # grace after resetsAt before we poke anything
 WAKE_CONFIRM = 300      # no new turn this long after a wake = it didn't take
@@ -1198,8 +1200,19 @@ def tick(caf, limits_box):
                     lim = limits_box['v'] = read_limits()
                 except Exception as e:
                     log(f'limits read failed: {e}')
+                    try:  # one network blip shouldn't cost Codex the tick: fall back on a fresh enough cached answer
+                        lim = json.loads(LIMITS_CACHE.read_text())
+                    except (OSError, ValueError):
+                        return False
+                    if now - lim.get('checked_at', 0) > LIMITS_STALE_OK:
+                        return False
+            if not lim.get('allowed'):
+                return False
+            # a run can't finish an item on the last few % of a window: wait for the reset or take a Claude seat
+            for w in (lim.get('primary'), lim.get('secondary')):
+                if w and (w.get('usedPercent') or 0) >= CODEX_START_MAX and (w.get('resetsAt') or 0) > now:
                     return False
-            return lim['allowed']
+            return True
 
         THREADS_NOW.clear(); THREADS_NOW.update(threads)
         for key, t in sorted({**live, **paused_runs}.items(), key=lambda kv: kv[1].get('priority', 2)):
