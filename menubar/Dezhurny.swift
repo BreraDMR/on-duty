@@ -19,6 +19,7 @@ struct Thread: Decodable, Identifiable {
     let open_thread: String?; let pending: Int?  // item-by-item duty: the questions chat, items parked for Damir
     let seat: String?                            // item-by-item duty: where the last run went (Codex / Claude 1 / Claude 2)
     let question: DutyQuestion?
+    let reason: String?
 }
 struct ClaudeWindow: Decodable { let usedPercent: Double?; let resetsAt: Double?; let resetPassed: Bool? }
 struct ClaudeAccount: Decodable, Identifiable {
@@ -217,7 +218,8 @@ struct Block<Content: View>: View {
 func stateText(_ t: Thread) -> String {
     switch t.state {
     case "running": return t.seat.map { "работает · \($0)" } ?? "работает"
-    case "limited": return t.seat != nil ? "все места в лимите, ждёт сброса" : "ждёт сброса лимита"
+    case "limited": return t.seat != nil ? "ждёт свободное место" : "ждёт сброса лимита"
+    case "held": return "ждёт по приоритету"
     case "idle": return "ждёт тебя"
     case "done": return "план закрыт"
     case "paused": return "на паузе"
@@ -426,6 +428,10 @@ struct PanelView: View {
                             }
                             Spacer()
                             threadMenu(t)
+                        }
+                        if let reason = t.reason, !reason.isEmpty {
+                            Text(reason).font(.caption2).foregroundStyle(.secondary)
+                                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                         }
                         if let q = t.question {
                             Text(q.text).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
