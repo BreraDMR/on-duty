@@ -904,6 +904,8 @@ def start_run(key, t, seat='3'):
         # json: the answer comes with its token count; unwrap_claude_json() puts the plain answer back in .last
         cmd = [str(CLAUDE_BIN), '-p', item_prompt(t), '--dangerously-skip-permissions',
                '--disallowedTools', 'Agent,Workflow', '--output-format', 'json']
+        if not plan_wants_mcp(t['plan']):
+            cmd.append('--strict-mcp-config')   # no --mcp-config next to it = no MCP servers
         with open(out, 'w') as f, open(last, 'w') as fl:
             p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fl, stderr=f, start_new_session=True)
     t.update(run_pid=p.pid, run_log=str(out), run_last=str(last), run_started=time.time(), seat=seat,
@@ -923,6 +925,21 @@ def plan_size(plan):
         return os.path.getsize(plan)
     except (OSError, TypeError):
         return None
+
+
+# A plan whose text names none of these gets a Claude run with no MCP servers at all. 18-19.11: 12 of 12 finished
+# runs started Playwright and Camoufox (200-300 MB each) and made 0 browser calls. Broad on purpose: a plan that
+# needs a tool and doesn't get it is worse than a few hundred MB.
+MCP_WORDS = ('playwright', 'camoufox', 'браузер', 'browser', 'chrome', 'хром', 'сайт', 'страниц', 'скриншот',
+             'снимок', 'classroom', 'jira', 'atlassian', 'confluence', 'mcp', 'stripe', 'figma', 'вкладк', 'url', 'http')
+
+
+def plan_wants_mcp(plan):
+    try:
+        text = Path(plan).read_text().lower()
+    except (OSError, TypeError):
+        return True
+    return any(w in text for w in MCP_WORDS)
 
 
 def unwrap_claude_json(key, t):
