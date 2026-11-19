@@ -17,7 +17,7 @@ by itself (checked 02.11.2026); a thread that isn't open in the app gets opened 
     codex_wake.py daemon                     the loop, run by launchd
     codex_wake.py on|off                     start / stop that launchd agent (off stays off after a reboot)
 """
-import argparse, fcntl, glob, json, os, signal, subprocess, sys, time
+import argparse, fcntl, glob, hashlib, json, os, re, signal, subprocess, sys, time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -799,6 +799,113 @@ def open_items(plan, mark=' '):
         return None
 
 
+def plan_question(plan):
+    """Last unanswered entry, with the parked item it belongs to. No guessing between items."""
+    try:
+        lines = Path(plan).read_text().splitlines(keepends=True)
+    except OSError:
+        return None
+    items = []
+    for i, line in enumerate(lines):
+        m = re.match(r'^- \[\?\]\s+(?:(\d+)[.)]\s+)?', line)
+        if m:
+            end = i + 1
+            while end < len(lines) and not re.match(r'^(?:- \[[ x?]\]|#{1,2}\s)', lines[end]):
+                end += 1
+            while end > i + 1 and not lines[end - 1].strip():
+                end -= 1
+            items.append((m[1], i, end))
+    start = next((i + 1 for i, line in enumerate(lines)
+                  if re.match(r'^##\s+На решение Дамиру\s*$', line)), len(lines))
+    end = next((i for i in range(start, len(lines)) if re.match(r'^#{1,2}\s', lines[i])), len(lines))
+    entries = []
+    bullets = any(re.match(r'^(?:[-*]\s|\d+[.)]\s)', line) for line in lines[start:end])
+    i = start
+    while i < end:
+        if not lines[i].strip():
+            i += 1
+            continue
+        j = i + 1
+        while j < end and (bullets or lines[j].strip()) and not re.match(r'^(?:[-*]\s|\d+[.)]\s)', lines[j]):
+            j += 1
+        while j > i + 1 and not lines[j - 1].strip():
+            j -= 1
+        raw = ''.join(lines[i:j])
+        text = re.sub(r'^(?:[-*]\s+|\d+[.)]\s+)', '', raw.strip())
+        if not re.match(r'^(?:Дамир\s+\d|решено\b|снято\b|#)', text, re.I):
+            numbers = set(re.findall(r'\bп(?:ункт(?:а|у|ы)?)?\.?\s*(\d+)|\((\d+)\)', text, re.I))
+            refs = {a or b for a, b in numbers}
+            matches = [item for item in items if item[0] in refs] if refs else items
+            if matches:
+                entries.append({'text': text, 'token': hashlib.sha256((raw + str(matches)).encode()).hexdigest(),
+                                'item': matches[0][0] if len(matches) == 1 else None,
+                                'span': (i, j), 'item_span': matches[0][1:] if len(matches) == 1 else None})
+        i = j
+    return entries[-1] if entries else None
+
+
+def answer_plan(key, text, expected=None):
+    text = text.strip()
+    if not text:
+        sys.exit('Ответ пустой — напиши решение Дамира.')
+    with watch_list() as data:
+        key = resolve(data, key)
+        t = data['threads'][key]
+        plan = Path(t.get('plan') or '').expanduser().resolve()
+        q = plan_question(plan)
+        if not q:
+            sys.exit('В плане нет неотвеченного вопроса с пунктом [?].')
+        if expected and expected != q['token']:
+            sys.exit('Вопрос уже изменился. Обнови окно и ответь на текущий вопрос.')
+        if q['item_span'] is None:
+            sys.exit('Вопрос относится к нескольким пунктам. Укажи в нём номер нужного пункта.')
+        original = plan.read_text()
+        lines = original.splitlines(keepends=True)
+        today = datetime.now().strftime('%d.%m.%Y')
+        # Indent pasted paragraphs so a new heading or checkbox can't escape the answer.
+        answer = text.replace('\n', '\n    ')
+        start, end = q['item_span']
+        item = lines[start:end]
+        item[0] = item[0].replace('- [?]', '- [ ]', 1)
+        if not item[-1].endswith('\n'):
+            item[-1] += '\n'
+        item.append(f'  - решение Дамира {today}: {answer}\n')
+        label = f'(п.{q["item"]}) ' if q['item'] else ''
+        edits = [(start, end, item), (*q['span'], [f'- Дамир {today}: {label}{answer}\n'])]
+        for start, end, replacement in sorted(edits, reverse=True):
+            lines[start:end] = replacement
+        updated = ''.join(lines)
+        plan.write_text(updated)
+        root = subprocess.run(['git', '-C', str(plan.parent), 'rev-parse', '--show-toplevel'],
+                              capture_output=True, text=True)
+        commit = None
+        if root.returncode == 0:
+            repo = Path(root.stdout.strip())
+            rel = str(plan.relative_to(repo))
+            tracked = subprocess.run(['git', '-C', str(repo), 'ls-files', '--error-unmatch', '--', rel],
+                                     capture_output=True).returncode == 0
+            try:
+                # --only uses a temporary index for tracked files, keeping other staged work intact even on failure.
+                if not tracked:
+                    subprocess.run(['git', '-C', str(repo), 'add', '--', rel], check=True, capture_output=True, text=True)
+                subprocess.run(['git', '-C', str(repo), 'commit', '--only', '-m', 'Record Damir answer in duty plan', '--', rel],
+                               check=True, capture_output=True, text=True)
+                commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+            except subprocess.CalledProcessError as e:
+                if plan.read_text() == updated:
+                    plan.write_text(original)
+                    if not tracked:
+                        subprocess.run(['git', '-C', str(repo), 'update-index', '--force-remove', '--', rel], capture_output=True)
+                    sys.exit(f'Коммит не получился: исходный план восстановлен, дежурство не продолжено.\n{e.stderr}')
+                sys.exit(f'Коммит не получился, план изменился во время записи. Проверь {plan}; дежурство не продолжено.\n{e.stderr}')
+        # Same reset as resume, after the answer has been saved (and committed when under git).
+        t.update(paused=False, done=False, waiting=False, failures=0, no_progress=0)
+        t['last_state'] = 'running' if pid_alive(t.get('run_pid')) else 'idle'
+        t.pop('handover', None)
+    log(f'answer {key}: plan {plan}, commit {commit or "not under git"}; resumed')
+    print(f'Ответ записан, дежурство продолжено{f" · {commit}" if commit else ""}.')
+
+
 def handover_text(t):
     """The previous run on this same item got cut off by a limit: tell the next one where it stopped."""
     h = t.get('handover')
@@ -1364,6 +1471,9 @@ def main():
     ai.add_argument('--mode', choices=list(MODE_RULES), default='review')
     qc = sub.add_parser('questions-chat', help='fallback chat for questions, used only if a fresh chat per question cannot be made')
     qc.add_argument('thread', nargs='?', default=os.environ.get('CODEX_THREAD_ID'))
+    an = sub.add_parser('answer', help='record Damir answer in the plan, commit it and resume the duty')
+    an.add_argument('thread'); an.add_argument('text')
+    an.add_argument('--question', help='refuse if the question shown in the window has changed')
     sub.add_parser('test-notify')
     for c in ('remove', 'pause', 'resume'):
         sp = sub.add_parser(c); sp.add_argument('thread')
@@ -1385,6 +1495,8 @@ def main():
     se.add_argument('n', choices=SEATS); se.add_argument('state', choices=('on', 'off'))
     args = ap.parse_args()
 
+    if args.cmd == 'answer':
+        return answer_plan(args.thread, args.text, args.question)
     if args.cmd == 'daemon':
         return daemon()
     if args.cmd in ('on', 'off'):
@@ -1525,10 +1637,12 @@ def main():
             # the menu bar knows running/limited/idle/done/paused; a question for Damir is its "idle" (= waits for you)
             state = ('paused' if t.get('paused') else 'done' if t.get('done') else 'idle' if t.get('waiting')
                      else {'stuck': 'paused'}.get(t.get('last_state'), t.get('last_state') or 'idle'))
+            question = plan_question(t['plan'])
             rows.append({'id': tid, 'name': t.get('name'), 'mode': t.get('mode'), 'plan': t.get('plan'), 'state': state,
                          'seat': SEAT_NAMES.get(t.get('seat') or '3'),
                          'state_at': t.get('state_at') or t.get('run_started'), 'wakes': t.get('runs', 0), 'loaded': False,
                          'open_thread': t.get('question_thread') or data.get('questions_thread'), 'pending': open_items(t['plan'], '?') or 0,
+                         'question': {k: question[k] for k in ('text', 'token', 'item')} if question else None,
                          'last_msg': f'запусков {t.get("runs", 0)}, место {SEAT_NAMES.get(t.get("seat") or "3")}, '
                                      f'открытых пунктов {open_items(t["plan"])}, '
                                      f'последний: {t.get("last_outcome") or "—"}, журнал {t.get("run_log") or "—"}'})
