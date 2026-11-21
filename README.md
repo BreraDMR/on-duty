@@ -12,6 +12,7 @@ Click the moon in the menu bar, look, click away. No numbers in the menu bar its
 
 - **Limits.** 5-hour and weekly windows for Codex and for every Claude Code account on the machine, as bars
   (green under 70 %, yellow under 90 %, red above) with the reset time.
+  Faint ticks mark every 16 % for Codex and every 14 % for Claude.
   - Codex: read from `codex app-server` (`account/rateLimits/read`), no tokens spent.
   - Claude: the same endpoint `/usage` uses, called with the account's own login from the macOS keychain.
     No tokens spent, at most once per 5 minutes. An expired login is never refreshed; the app just shows older numbers.
