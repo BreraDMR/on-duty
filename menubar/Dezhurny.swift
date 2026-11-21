@@ -190,7 +190,7 @@ final class Model: ObservableObject {
 // ---------- pieces ----------
 
 struct Bar: View {
-    let label: String; let percent: Double?; let reset: Double?; let tickStep: Int; var passed = false
+    let label: String; let percent: Double?; let reset: Double?; var tickStep: Int? = nil; var passed = false
     var body: some View {
         let p = passed ? 0 : min(max(percent ?? 0, 0), 100)
         HStack(spacing: 6) {
@@ -199,11 +199,13 @@ struct Bar: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.gray.opacity(0.25))
                     Capsule().fill(levelColor(p)).frame(width: max(g.size.width * p / 100, p > 0 ? 3 : 0))
-                    ForEach(Array(stride(from: tickStep, to: 100, by: tickStep)), id: \.self) { mark in
-                        Rectangle().fill(Color.primary.opacity(0.16))
-                            .frame(width: 1, height: g.size.height)
-                            .position(x: g.size.width * Double(mark) / 100, y: g.size.height / 2)
-                            .accessibilityHidden(true)
+                    if let tickStep {
+                        ForEach(Array(stride(from: tickStep, to: 100, by: tickStep)), id: \.self) { mark in
+                            Rectangle().fill(Color.primary.opacity(0.16))
+                                .frame(width: 1, height: g.size.height)
+                                .position(x: g.size.width * Double(mark) / 100, y: g.size.height / 2)
+                                .accessibilityHidden(true)
+                        }
                     }
                 }
                 .clipShape(Capsule())
@@ -322,7 +324,7 @@ struct PanelView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Codex").font(.callout.weight(.medium))
                 if let l = m.status?.limits {
-                    Bar(label: "5 ч", percent: l.primary?.usedPercent, reset: l.primary?.resetsAt, tickStep: 16)
+                    Bar(label: "5 ч", percent: l.primary?.usedPercent, reset: l.primary?.resetsAt)
                     Bar(label: "нед", percent: l.secondary?.usedPercent, reset: l.secondary?.resetsAt, tickStep: 16)
                     TokenLine(w: m.status?.tokens?.codex)
                     if let n = l.free_resets, n > 0 {
@@ -340,7 +342,7 @@ struct PanelView: View {
                         if let age = ageText(a.updated_at) { Text(age).font(.caption2).foregroundStyle(.secondary) }
                     }
                     Bar(label: "5 ч", percent: a.five_hour?.usedPercent, reset: a.five_hour?.resetsAt,
-                        tickStep: 14, passed: a.five_hour?.resetPassed == true)
+                        passed: a.five_hour?.resetPassed == true)
                     Bar(label: "нед", percent: a.week?.usedPercent, reset: a.week?.resetsAt,
                         tickStep: 14, passed: a.week?.resetPassed == true)
                 }
